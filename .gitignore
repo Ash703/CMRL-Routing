@@ -1,0 +1,13 @@
+#Virtual Environment
+venv/
+.env/
+.venv/
+
+.flowmanager/
+.sdn_lab/
+
+.vscode/
+
+__pycache__/
+*.py[cod]
+*$py.class

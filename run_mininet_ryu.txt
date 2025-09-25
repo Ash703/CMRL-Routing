@@ -1,4 +1,4 @@
 
-sudo PYTHONPATH="/home/Ash/Documents/ACN/CMRL-Routing/venv/lib/python3.9/site-packages" python3 scripts/mn_spineleaf_topo.py scripts/network_config.yaml
+sudo PYTHONPATH="/home/Ash/Documents/ACN/CMRL-Routing/venv/lib/python3.9/site-packages" python3 src/topo/mn_spineleaf_topo.py src/network_config.yaml
 
-NETWORK_CONFIG_FILE=sdn_lab/scripts/network_config.yaml ryu-manager --observe-links flowmanager/flowmanager.py sdn_lab/scripts/dc_switch_1.py
+NETWORK_CONFIG_FILE=sdn_lab/scripts/network_config.yaml ryu-manager --observe-links flowmanager/flowmanager.py src/controller/dc_switch_1.py

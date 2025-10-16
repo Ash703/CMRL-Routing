@@ -64,6 +64,3 @@ def stop_traffic(net):
     info("*** Stopping all iperf3 processes\n")
     for h in net.hosts:
         h.cmd("pkill iperf3")
-
-if __name__ == "__main__":
-    print("⚠️ This script is intended to be imported and called from your topology script.")

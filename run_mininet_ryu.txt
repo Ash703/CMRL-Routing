@@ -1,4 +1,7 @@
 
 sudo PYTHONPATH="/home/Ash/Documents/ACN/CMRL-Routing/venv/lib/python3.9/site-packages" python3 src/topo/mn_spineleaf_topo.py src/network_config.yaml
 
-NETWORK_CONFIG_FILE=sdn_lab/scripts/network_config.yaml ryu-manager --observe-links flowmanager/flowmanager.py src/controller/dc_switch_1.py
+source venv/bin/activate
+NETWORK_CONFIG_FILE=src/network_config.yaml ryu-manager --observe-links flowmanager/flowmanager.py src/controller/dc_switch_1.py
+
+py exec("import sys; sys.path.append('/home/Ash/Documents/ACN/CMRL-Routing/src/topo'); from traffic_gen3 import start_servers, generate_traffic; start_servers(net); generate_traffic(net, num_flows=15)")

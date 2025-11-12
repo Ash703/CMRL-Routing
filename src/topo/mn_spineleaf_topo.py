@@ -80,16 +80,14 @@ def create_mininet_network(config_file, ctrl="127.0.0.1"):
 if __name__ == "__main__":
     ctrl_address = os.getenv("SDN_CONTROLLER", "127.0.0.1")
 
-    # Check if the command-line argument is provided
     if len(sys.argv) < 2:
         print(
             "Usage: sudo ./path/mn_spineleaf_topo.py <netconfig_file> [controller_address]"
         )
         sys.exit(1)
 
-    config_file = sys.argv[1]  # Get the config file name from the command-line argument
+    config_file = sys.argv[1]
 
-    # Get the controller address. This overrides the env. variable
     if len(sys.argv) > 2:
         ctrl_address = sys.argv[2]
 

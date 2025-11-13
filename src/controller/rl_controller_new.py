@@ -1,9 +1,16 @@
-# src/controller/rl_ryu_controller_config_patched.py
+# src/controller/rl_ryu_controller_final.py
 """
-Patched Ryu controller (fixed datapath installs, deltas, timeouts, cleanup).
-Designed for the YAML topology (s11/s12 = 11/12 spines, s21/s22/s23 = 21/22/23 leaves).
+Final patched Ryu controller for the YAML leaf-spine topology.
+Features:
+ - Network-wide ARP broadcast (sent via leaf uplinks -> spines -> target leaf)
+ - SAME-LEAF fast path (direct host-to-host on leaf)
+ - End-to-end flow install (ingress leaf -> chosen spine -> egress leaf -> host)
+ - Reverse flows installed symmetrically
+ - Elephant flows: SELECT group on ingress leaf + spine/egress flows
+ - Uses OpenFlow port/flow stats for RL input
+ - Idle timeouts for flows, group cleanup
+ - Thread-safe (Lock) around shared state
 """
-
 import time
 import numpy as np
 from collections import deque
@@ -16,8 +23,7 @@ from ryu.lib import hub
 from ryu.ofproto import ofproto_v1_3
 from ryu.lib.packet import packet, ethernet, ipv4, arp
 
-# Import ActorCritic implementation — keep the same import you used earlier.
-# Adjust if your PYTHONPATH differs.
+# RL model: keep unchanged (controller expects policy(state_np) -> (probs, action_idx))
 from src.rl.rl_model import ActorCritic
 
 # ---------------------------
@@ -38,82 +44,85 @@ BETA  = 1.0   # utilization skew penalty
 GAMMA = 1.0   # packet loss penalty
 DELTA = 0.0   # latency penalty (0 by default)
 
-# Topology mapping derived from your YAML config
-LEAF_SPINE_PORTS = {21: [1, 2], 22: [1, 2], 23: [1, 2]}
+# Topology mapping (from your YAML)
+LEAF_SPINE_PORTS = {21: [1, 2], 22: [1, 2], 23: [1, 2]}   # leaf -> [uplink ports to spines]
 HOST_TO_LEAF = {
     "10.1.1.1": 21, "10.1.1.2": 21,
     "10.1.1.3": 22, "10.1.1.4": 22,
     "10.1.1.5": 23, "10.1.1.6": 23,
 }
-
 HOST_PORT = {
-    "10.1.1.1": 3,
-    "10.1.1.2": 4,
-    "10.1.1.3": 3,
-    "10.1.1.4": 4,
-    "10.1.1.5": 3,
-    "10.1.1.6": 4
+    "10.1.1.1": 3, "10.1.1.2": 4,
+    "10.1.1.3": 3, "10.1.1.4": 4,
+    "10.1.1.5": 3, "10.1.1.6": 4,
 }
+
+# Spine ordering: candidate_ports order -> spine dpids
+SPINES = [11, 12]
+
+# SPINE -> leaf port mapping (from your YAML links)
+# s11: ports 1,2,3 connect to leaves 21,22,23 respectively
+# s12: ports 1,2,3 connect to leaves 21,22,23 respectively (source_port numbers on spines)
 SPINE_TO_LEAF_PORTS = {
     11: {21: 1, 22: 2, 23: 3},
     12: {21: 1, 22: 2, 23: 3},
 }
-
 
 class RLDCController(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
     def __init__(self, *args, **kwargs):
         super(RLDCController, self).__init__(*args, **kwargs)
+
         # bookkeeping
         self.datapaths = {}              # dpid -> datapath
-        self.port_stats = {}             # dpid -> port -> {'tx','rx','ts','util','tx_dropped','rx_dropped','tx_dropped_delta','rx_dropped_delta'}
+        self.port_stats = {}             # dpid -> port -> {'tx','rx','ts','util','tx_dropped',...}
         self.flow_stats_cache = {}       # dpid -> list of flow stats (latest)
-        self.flow_prev_bytes = {}        # ((src,dst), dpid) -> previous byte_count (for throughput delta)
-        # memory for flows waiting reward computation
-        self.flow_memory = {}            # (src,dst) -> metadata (contains 'flow_key')
+        self.flow_prev_bytes = {}        # ((src,dst), dpid) -> previous byte_count
+        self.flow_memory = {}            # (src,dst) -> meta for training
         self.transitions = deque(maxlen=5000)
+        self.groups_last_used = {}       # (dpid, group_id) -> last_used_ts
 
-        # groups bookkeeping for cleanup: (dpid, group_id) -> last_used_ts
-        self.groups_last_used = {}
-
-        # thread lock for shared structures
         self.lock = Lock()
 
-        # RL model: input_dim = number of candidate paths (we use 2 spines)
-        num_paths = 2
+        # RL model (unchanged)
+        num_paths = len(SPINES)
         self.model = ActorCritic(input_dim=num_paths, num_actions=num_paths, device=DEVICE)
 
-        # spawn monitor & trainer threads & group cleaner
+        # threads
         self.monitor_thread = hub.spawn(self._monitor)
         self.trainer_thread = hub.spawn(self._trainer)
         self.cleaner_thread = hub.spawn(self._group_cleaner)
-        self.logger.info("RLDCController (patched) initialized")
-
-    
-    def _get_host_port(self, leaf, host_ip):
-        return HOST_PORT[host_ip]
+        self.logger.info("RLDCController (final) initialized")
 
     # -------------------------
-    # Table-miss: install on switch features
+    # helpers
+    # -------------------------
+    def _get_host_port(self, leaf, host_ip):
+        return HOST_PORT.get(host_ip)
+
+    def _group_id_from_flow(self, flow_key):
+        return (abs(hash(flow_key)) % (2**31 - 1)) or 1
+
+    # -------------------------
+    # Table-miss
     # -------------------------
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
         dp = ev.msg.datapath
-        ofp = dp.ofproto
         parser = dp.ofproto_parser
+        ofp = dp.ofproto
 
-        # Table-miss flow entry: send unmatched packets to controller
+        # send unmatched to controller
         match = parser.OFPMatch()
         actions = [parser.OFPActionOutput(ofp.OFPP_CONTROLLER, ofp.OFPCML_NO_BUFFER)]
         inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
         mod = parser.OFPFlowMod(datapath=dp, priority=0, match=match, instructions=inst)
         dp.send_msg(mod)
-
         self.logger.info("Installed table-miss on switch %s", dp.id)
 
     # -------------------------
-    # OF event: switches connect/disconnect
+    # State change
     # -------------------------
     @set_ev_cls(ofp_event.EventOFPStateChange, [MAIN_DISPATCHER, CONFIG_DISPATCHER])
     def _state_change(self, ev):
@@ -130,7 +139,7 @@ class RLDCController(app_manager.RyuApp):
             self.logger.info("Datapath %s disconnected", dp.id)
 
     # -------------------------
-    # Polling for port & flow stats
+    # Polling
     # -------------------------
     def _monitor(self):
         while True:
@@ -199,19 +208,19 @@ class RLDCController(app_manager.RyuApp):
             self.flow_stats_cache[dpid] = ev.msg.body
 
     # -------------------------
-    # Packet-in: decide path and install flows/groups
+    # Packet-in
     # -------------------------
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in(self, ev):
         msg = ev.msg
-        dp_packetin = msg.datapath           # datapath that sent this PacketIn
+        dp_packetin = msg.datapath
         parser_pi = dp_packetin.ofproto_parser
         ofp_pi = dp_packetin.ofproto
 
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocol(ethernet.ethernet)
 
-        # ARP: flood (fast path) so hosts can learn each other's MACs
+        # ---- ARP handling --------------------------------------------------
         if eth and eth.ethertype == 0x0806:  # ARP
             arp_pkt = pkt.get_protocol(arp.arp)
             if not arp_pkt:
@@ -269,7 +278,9 @@ class RLDCController(app_manager.RyuApp):
             )
             src_dp.send_msg(out)
             return
-        
+        # ------------------ end ARP ------------------
+
+        # handle IPv4 flows (RL-driven forwarding)
         ip = pkt.get_protocol(ipv4.ipv4)
         if not ip:
             return
@@ -278,14 +289,14 @@ class RLDCController(app_manager.RyuApp):
         dst = ip.dst
         flow_key = (src, dst)
 
-        # Determine ingress leaf dpid for this src
         ingress_leaf = HOST_TO_LEAF.get(src)
+        dst_leaf = HOST_TO_LEAF.get(dst)
+
         if ingress_leaf is None:
-            # unknown host mapping (out of our YAML); fallback flood
+            # unknown host mapping: flood
             actions = [parser_pi.OFPActionOutput(ofp_pi.OFPP_FLOOD)]
             data = msg.data if msg.buffer_id == ofp_pi.OFP_NO_BUFFER else None
-            out = parser_pi.OFPPacketOut(datapath=dp_packetin, buffer_id=msg.buffer_id,
-                                         in_port=msg.match['in_port'], actions=actions, data=data)
+            out = parser_pi.OFPPacketOut(datapath=dp_packetin, buffer_id=msg.buffer_id, in_port=msg.match.get('in_port'), actions=actions, data=data)
             dp_packetin.send_msg(out)
             return
 
@@ -293,44 +304,40 @@ class RLDCController(app_manager.RyuApp):
         if not candidate_ports:
             actions = [parser_pi.OFPActionOutput(ofp_pi.OFPP_FLOOD)]
             data = msg.data if msg.buffer_id == ofp_pi.OFP_NO_BUFFER else None
-            out = parser_pi.OFPPacketOut(datapath=dp_packetin, buffer_id=msg.buffer_id,
-                                         in_port=msg.match['in_port'], actions=actions, data=data)
+            out = parser_pi.OFPPacketOut(datapath=dp_packetin, buffer_id=msg.buffer_id, in_port=msg.match.get('in_port'), actions=actions, data=data)
             dp_packetin.send_msg(out)
             return
-        
-        dst_leaf = HOST_TO_LEAF.get(dst)
+
+        # ------------------ SAME-LEAF FAST PATH ------------------
         if dst_leaf is not None and dst_leaf == ingress_leaf:
-            # get datapath for ingress leaf
             dp_ing = self.datapaths.get(ingress_leaf)
             if dp_ing is None:
-                # fallback: flood via packet-in datapath
-                self.logger.warning("Ingress leaf %s not in datapaths for same-leaf case; flooding", ingress_leaf)
-                actions = [parser_pi.OFPActionOutput(ofp_pi.OFPP_FLOOD)]
-                out = parser_pi.OFPPacketOut(datapath=dp_packetin, buffer_id=msg.buffer_id,
-                                            in_port=msg.match['in_port'], actions=actions, data=msg.data)
+                self.logger.warning("Ingress leaf %s not registered; flooding", ingress_leaf)
+                out = parser_pi.OFPPacketOut(datapath=dp_packetin, buffer_id=msg.buffer_id, in_port=msg.match.get('in_port'), actions=[parser_pi.OFPActionOutput(ofp_pi.OFPP_FLOOD)], data=msg.data)
                 dp_packetin.send_msg(out)
                 return
 
-            # find host ports (helper _get_host_port defined below)
             out_port = self._get_host_port(ingress_leaf, dst)
             in_port = self._get_host_port(ingress_leaf, src)
 
-            # install forwarding both directions on the leaf with idle timeout
+            # install forward & reverse flows on the leaf
             self._install_simple_flow(dp_ing, src, dst, out_port, idle_timeout=FLOW_IDLE_TIMEOUT)
             self._install_simple_flow(dp_ing, dst, src, in_port, idle_timeout=FLOW_IDLE_TIMEOUT)
 
-            self.logger.info("SAME-LEAF %s->%s installed on leaf %s ports %s<->%s",
-                            src, dst, ingress_leaf, in_port, out_port)
+            self.logger.info("SAME-LEAF %s->%s on leaf %s ports %s<->%s", src, dst, ingress_leaf, in_port, out_port)
 
-            # immediately forward the current packet to the out_port using the packet-in datapath
-            actions_out = [parser_pi.OFPActionOutput(out_port)]
-            data = msg.data if msg.buffer_id == ofp_pi.OFP_NO_BUFFER else None
-            out = parser_pi.OFPPacketOut(datapath=dp_packetin, buffer_id=msg.buffer_id,
-                                        in_port=msg.match['in_port'], actions=actions_out, data=data)
-            dp_packetin.send_msg(out)
+            # send PacketOut from ingress leaf (use controller as in_port)
+            try:
+                parser_ing = dp_ing.ofproto_parser
+                ofp_ing = dp_ing.ofproto
+                out = parser_ing.OFPPacketOut(datapath=dp_ing, buffer_id=ofp_ing.OFP_NO_BUFFER, in_port=ofp_ing.OFPP_CONTROLLER, actions=[parser_ing.OFPActionOutput(out_port)], data=msg.data)
+                dp_ing.send_msg(out)
+            except Exception as e:
+                self.logger.debug("PacketOut same-leaf failed: %s", e)
             return
+        # ------------------ end same-leaf ------------------
 
-        # Build state using ingress_leaf port utils — ensure we read under lock
+        # build state vector (one util per candidate port)
         with self.lock:
             state = []
             for p in candidate_ports:
@@ -338,58 +345,84 @@ class RLDCController(app_manager.RyuApp):
                 state.append(min(util / CAPACITY_Mbps, 1.0))
         state_np = np.array(state, dtype=np.float32)
 
-        # Elephant detection using FlowStats cache on ingress_leaf datapath
+        # elephant detection
         is_elephant = self._is_elephant(flow_key, ingress_leaf)
 
-        # Query policy (actor-critic)
+        # policy (keeps the RL model unchanged)
         probs, action_idx = self.model.policy(state_np)
 
-        # Use the ingress leaf datapath object for installs
+        # ensure dp_ing exists
         dp_ing = self.datapaths.get(ingress_leaf)
         if dp_ing is None:
-            # fallback: flood via packet-in datapath and log
-            self.logger.warning("Ingress leaf %s not in datapaths; flooding packet", ingress_leaf)
-            actions = [parser_pi.OFPActionOutput(ofp_pi.OFPP_FLOOD)]
-            out = parser_pi.OFPPacketOut(datapath=dp_packetin, buffer_id=msg.buffer_id,
-                                         in_port=msg.match['in_port'], actions=actions, data=msg.data)
+            self.logger.warning("Ingress leaf %s not in datapaths; flooding", ingress_leaf)
+            out = parser_pi.OFPPacketOut(datapath=dp_packetin, buffer_id=msg.buffer_id, in_port=msg.match.get('in_port'), actions=[parser_pi.OFPActionOutput(ofp_pi.OFPP_FLOOD)], data=msg.data)
             dp_packetin.send_msg(out)
             return
 
+        # chosen uplink port on ingress leaf
+        chosen_idx = int(np.argmax(probs)) if not is_elephant else action_idx
+        chosen_port = candidate_ports[chosen_idx]
 
+        # install on ingress leaf
         if not is_elephant:
-            # Mice -> single path (argmax)
-            chosen_idx = int(np.argmax(probs))
-            chosen_port = candidate_ports[chosen_idx]
-            # install flow on ingress leaf datapath with idle_timeout
+            # mice: install direct flow to chosen uplink port
             self._install_simple_flow(dp_ing, src, dst, chosen_port, idle_timeout=FLOW_IDLE_TIMEOUT)
             flow_type = 'mice'
             self.logger.info("MICE %s->%s chosen port %s at leaf %s", src, dst, chosen_port, ingress_leaf)
-            # send packet out through packet-in datapath to chosen port (could also send via dp_ing)
-            actions_out = [parser_pi.OFPActionOutput(chosen_port)]
+            actions_out = [dp_ing.ofproto_parser.OFPActionOutput(chosen_port)]
         else:
-            # Elephant -> install SELECT group with weights proportional to probs
+            # elephant: install select group on ingress (weights proportional to probs)
             weights = (probs * GROUP_WEIGHT_SCALE).astype(int)
             weights = np.maximum(weights, 1)
             gid = self._group_id_from_flow(flow_key)
-            # install group on ingress leaf datapath (use parser_ing)
             self._install_select_group(dp_ing, gid, candidate_ports, weights)
-            # install flow that forwards to group (on ingress)
             self._install_flow_to_group(dp_ing, src, dst, gid, idle_timeout=FLOW_IDLE_TIMEOUT)
             flow_type = 'elephant'
-            self.logger.info("ELEPHANT %s->%s group %s ports %s weights %s at leaf %s",
-                             src, dst, gid, candidate_ports, weights.tolist(), ingress_leaf)
-            actions_out = [parser_pi.OFPActionGroup(gid)]
-            # mark group last used now
+            self.logger.info("ELEPHANT %s->%s group %s ports %s weights %s at leaf %s", src, dst, gid, candidate_ports, weights.tolist(), ingress_leaf)
+            actions_out = [dp_ing.ofproto_parser.OFPActionGroup(gid)]
             with self.lock:
                 self.groups_last_used[(ingress_leaf, gid)] = time.time()
 
-        # store metadata for training/reward — detach logp tensor to avoid graph issues
+        # ---------- INSTALL spine + egress leaf rules ----------
+        spine_dpid = SPINES[chosen_idx] if chosen_idx < len(SPINES) else SPINES[0]
+        dp_spine = self.datapaths.get(spine_dpid)
+        if dp_spine is not None:
+            spine_out_port = SPINE_TO_LEAF_PORTS.get(spine_dpid, {}).get(dst_leaf)
+            if spine_out_port is not None:
+                self._install_simple_flow(dp_spine, src, dst, spine_out_port, idle_timeout=FLOW_IDLE_TIMEOUT)
+
+        # install egress leaf -> host flow
+        dp_dst = self.datapaths.get(dst_leaf)
+        dst_host_port = self._get_host_port(dst_leaf, dst)
+        if dp_dst is not None and dst_host_port is not None:
+            self._install_simple_flow(dp_dst, src, dst, dst_host_port, idle_timeout=FLOW_IDLE_TIMEOUT)
+
+        # also install reverse path entries:
+        if dp_spine is not None:
+            spine_back_port = SPINE_TO_LEAF_PORTS.get(spine_dpid, {}).get(ingress_leaf)
+            if spine_back_port is not None:
+                self._install_simple_flow(dp_spine, dst, src, spine_back_port, idle_timeout=FLOW_IDLE_TIMEOUT)
+
+        if dp_dst is not None and dp_spine is not None:
+            uplinks = LEAF_SPINE_PORTS.get(dst_leaf, [])
+            idx_of_spine = SPINES.index(spine_dpid) if spine_dpid in SPINES else None
+            dst_uplink_port = None
+            if idx_of_spine is not None and idx_of_spine < len(uplinks):
+                dst_uplink_port = uplinks[idx_of_spine]
+            if dst_uplink_port is not None:
+                self._install_simple_flow(dp_dst, dst, src, dst_uplink_port, idle_timeout=FLOW_IDLE_TIMEOUT)
+
+        # ingress leaf reverse to host
+        src_host_port = self._get_host_port(ingress_leaf, src)
+        if dp_ing is not None and src_host_port is not None:
+            self._install_simple_flow(dp_ing, dst, src, src_host_port, idle_timeout=FLOW_IDLE_TIMEOUT)
+
+        # store metadata for training/reward
         meta = {
             'flow_key': flow_key,
             'dpid': ingress_leaf,
             'state': state_np,
-            'action_idx': action_idx,
-            # 'logp': logp.detach() if hasattr(logp, 'detach') else logp,
+            'action_idx': chosen_idx,
             'time': time.time(),
             'type': flow_type,
             'candidate_ports': candidate_ports
@@ -397,21 +430,19 @@ class RLDCController(app_manager.RyuApp):
         with self.lock:
             self.flow_memory[flow_key] = meta
 
-        # send the current packet out using packet-in datapath
-        data = msg.data if msg.buffer_id == ofp_pi.OFP_NO_BUFFER else None
-        out = parser_pi.OFPPacketOut(datapath=dp_packetin,
-                                     buffer_id=msg.buffer_id,
-                                     in_port=msg.match['in_port'],
-                                     actions=actions_out,
-                                     data=data)
-        dp_packetin.send_msg(out)
+        # send the current packet out from ingress leaf (use controller as in_port)
+        try:
+            parser_ing = dp_ing.ofproto_parser
+            ofp_ing = dp_ing.ofproto
+            out = parser_ing.OFPPacketOut(datapath=dp_ing, buffer_id=ofp_ing.OFP_NO_BUFFER, in_port=ofp_ing.OFPP_CONTROLLER, actions=actions_out, data=msg.data)
+            dp_ing.send_msg(out)
+        except Exception as e:
+            self.logger.debug("PacketOut to ingress leaf failed: %s", e)
 
     # -------------------------
     # Flow detection helper
     # -------------------------
     def _is_elephant(self, flow_key, dpid):
-        """Check cached FlowStats for flow (src,dst) on dpid. If byte_count >= threshold -> elephant.
-           Also initializes flow_prev_bytes for future throughput calculation (but does not overwrite if missing)."""
         stats = []
         with self.lock:
             stats = list(self.flow_stats_cache.get(dpid, []))
@@ -430,76 +461,61 @@ class RLDCController(app_manager.RyuApp):
         key = ((src, dst), dpid)
         prev = self.flow_prev_bytes.get(key)
         if prev is None:
-            # record initial byte count and wait for next interval to compute throughput
             self.flow_prev_bytes[key] = byte_count
-        # decide elephant based on absolute byte_count (not delta) — you can change policy
         return byte_count >= ELEPHANT_BYTES
 
     # -------------------------
     # Flow & group install helpers
     # -------------------------
     def _install_simple_flow(self, datapath, src, dst, out_port, priority=200, idle_timeout=0):
+        if datapath is None or out_port is None:
+            return
         parser = datapath.ofproto_parser
         ofp = datapath.ofproto
         match = parser.OFPMatch(eth_type=0x0800, ipv4_src=src, ipv4_dst=dst)
         actions = [parser.OFPActionOutput(out_port)]
         inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
-        mod = parser.OFPFlowMod(datapath=datapath, priority=priority, match=match,
-                                instructions=inst, idle_timeout=idle_timeout)
+        mod = parser.OFPFlowMod(datapath=datapath, priority=priority, match=match, instructions=inst, idle_timeout=idle_timeout)
         datapath.send_msg(mod)
 
     def _install_select_group(self, datapath, group_id, out_ports, weights):
-        ofp = datapath.ofproto
+        if datapath is None:
+            return
         parser = datapath.ofproto_parser
+        ofp = datapath.ofproto
         buckets = []
         for p, w in zip(out_ports, weights):
             actions = [parser.OFPActionOutput(p)]
             buckets.append(parser.OFPBucket(weight=int(w), watch_port=p, watch_group=ofp.OFPG_ANY, actions=actions))
-        # try modify then add
-        grp_mod = parser.OFPGroupMod(datapath=datapath, command=ofp.OFPGC_MODIFY,
-                                     type_=ofp.OFPGT_SELECT, group_id=group_id, buckets=buckets)
+        grp_mod = parser.OFPGroupMod(datapath=datapath, command=ofp.OFPGC_MODIFY, type_=ofp.OFPGT_SELECT, group_id=group_id, buckets=buckets)
         try:
             datapath.send_msg(grp_mod)
         except Exception:
-            grp_mod = parser.OFPGroupMod(datapath=datapath, command=ofp.OFPGC_ADD,
-                                         type_=ofp.OFPGT_SELECT, group_id=group_id, buckets=buckets)
+            grp_mod = parser.OFPGroupMod(datapath=datapath, command=ofp.OFPGC_ADD, type_=ofp.OFPGT_SELECT, group_id=group_id, buckets=buckets)
             datapath.send_msg(grp_mod)
-        # update last used timestamp
         with self.lock:
             self.groups_last_used[(datapath.id, group_id)] = time.time()
 
     def _install_flow_to_group(self, datapath, src, dst, group_id, priority=200, idle_timeout=0):
+        if datapath is None:
+            return
         parser = datapath.ofproto_parser
         ofp = datapath.ofproto
         match = parser.OFPMatch(eth_type=0x0800, ipv4_src=src, ipv4_dst=dst)
         inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, [parser.OFPActionGroup(group_id)])]
-        mod = parser.OFPFlowMod(datapath=datapath, priority=priority, match=match,
-                                instructions=inst, idle_timeout=idle_timeout)
+        mod = parser.OFPFlowMod(datapath=datapath, priority=priority, match=match, instructions=inst, idle_timeout=idle_timeout)
         datapath.send_msg(mod)
-
-    def _group_id_from_flow(self, flow_key):
-        return (abs(hash(flow_key)) % (2**31 - 1)) or 1
 
     # -------------------------
     # Reward computation & trainer
     # -------------------------
     def _compute_reward(self, flow_key, meta):
-        """
-        reward = alpha * throughput_gain
-                 - beta * util_skew
-                 - gamma * packet_loss
-                 - delta * latency_penalty
-        All sub-terms normalized to [0,1]; reward clipped to [-1,1].
-        """
         dpid = meta['dpid']
         candidate_ports = meta['candidate_ports']
-
-        # get (src,dst)
         src_ip, dst_ip = meta.get('flow_key', (None, None))
         if src_ip is None:
             return None
 
-        # find flow byte_count from flow_stats_cache
         with self.lock:
             stats = list(self.flow_stats_cache.get(dpid, []))
         byte_count = None
@@ -512,29 +528,24 @@ class RLDCController(app_manager.RyuApp):
         key_prev = ((src_ip, dst_ip), dpid)
         prev_bytes = self.flow_prev_bytes.get(key_prev, None)
         if prev_bytes is None:
-            # store and wait
             if byte_count is not None:
                 self.flow_prev_bytes[key_prev] = byte_count
             return None
         if byte_count is None:
             return None
 
-        # compute throughput (Mbps) over POLL_INTERVAL
         interval = POLL_INTERVAL
         bytes_delta = max(0, byte_count - prev_bytes)
         throughput_mbps = (bytes_delta * 8.0) / (interval * 1e6)
         flow_throughput_norm = min(throughput_mbps / CAPACITY_Mbps, 1.0)
-        # update prev
         self.flow_prev_bytes[key_prev] = byte_count
 
-        # Link utilization skew
         with self.lock:
             utils = [min(self.port_stats.get(dpid, {}).get(p, {}).get('util', 0.0) / CAPACITY_Mbps, 1.0) for p in candidate_ports]
         if not utils:
             return None
-        util_skew = float(np.std(utils))  # already approx 0..1
+        util_skew = float(np.std(utils))
 
-        # packet_loss: use deltas stored in port_stats
         with self.lock:
             drop_sum = 0.0
             for p in candidate_ports:
@@ -542,14 +553,13 @@ class RLDCController(app_manager.RyuApp):
                 drop_sum += float(entry.get('tx_dropped_delta', 0) + entry.get('rx_dropped_delta', 0))
         packet_loss_norm = min(drop_sum / 1000.0, 1.0)
 
-        latency_penalty = 0.0  # optional probing can set this
+        latency_penalty = 0.0
 
         reward = (ALPHA * flow_throughput_norm) - (BETA * util_skew) - (GAMMA * packet_loss_norm) - (DELTA * latency_penalty)
         reward = max(-1.0, min(1.0, reward))
         return reward
 
     def _trainer(self):
-        """Periodically evaluate stored flows and create transitions for training"""
         while True:
             with self.lock:
                 keys = list(self.flow_memory.keys())
@@ -563,24 +573,19 @@ class RLDCController(app_manager.RyuApp):
                     if r is not None:
                         s = meta['state']
                         a = meta['action_idx']
-                        logp = None #ignored by ActorCritic now
                         dpid = meta['dpid']
                         candidate_ports = meta['candidate_ports']
-                        # next state sample
                         with self.lock:
-                            next_state = [min(self.port_stats.get(dpid, {}).get(p, {}).get('util', 0.0) / CAPACITY_Mbps, 1.0)
-                                          for p in candidate_ports]
+                            next_state = [min(self.port_stats.get(dpid, {}).get(p, {}).get('util', 0.0) / CAPACITY_Mbps, 1.0) for p in candidate_ports]
                         next_state_np = np.array(next_state, dtype=np.float32)
                         done = False
-                        # append transition
-                        self.transitions.append((s, a, r, next_state_np, done, logp))
-                        # remove meta
+                        logp_placeholder = None
+                        self.transitions.append((s, a, r, next_state_np, done, logp_placeholder))
                         with self.lock:
                             try:
                                 del self.flow_memory[k]
                             except KeyError:
                                 pass
-            # train if enough transitions
             if len(self.transitions) >= TRAIN_BATCH_SIZE:
                 batch = [self.transitions.popleft() for _ in range(min(len(self.transitions), TRAIN_BATCH_SIZE))]
                 res = self.model.update(batch)
@@ -593,10 +598,9 @@ class RLDCController(app_manager.RyuApp):
             hub.sleep(POLL_INTERVAL)
 
     # -------------------------
-    # Group cleanup thread
+    # Group cleanup
     # -------------------------
     def _group_cleaner(self):
-        """Periodically remove groups that haven't been used for GROUP_IDLE_TIMEOUT seconds."""
         while True:
             now = time.time()
             stale = []
@@ -606,18 +610,17 @@ class RLDCController(app_manager.RyuApp):
                         stale.append((dpid, gid))
             for dpid, gid in stale:
                 dp = self.datapaths.get(dpid)
-                if not dp:
+                if dp is None:
                     with self.lock:
-                        del self.groups_last_used[(dpid, gid)]
+                        if (dpid, gid) in self.groups_last_used:
+                            del self.groups_last_used[(dpid, gid)]
                     continue
                 parser = dp.ofproto_parser
                 ofp = dp.ofproto
                 try:
-                    grp_del = parser.OFPGroupMod(datapath=dp, command=ofp.OFPGC_DELETE,
-                                                 type_=ofp.OFPGT_ALL, group_id=gid, buckets=[])
+                    grp_del = parser.OFPGroupMod(datapath=dp, command=ofp.OFPGC_DELETE, type_=ofp.OFPGT_ALL, group_id=gid, buckets=[])
                     dp.send_msg(grp_del)
                 except Exception:
-                    # ignore delete errors
                     pass
                 with self.lock:
                     if (dpid, gid) in self.groups_last_used:

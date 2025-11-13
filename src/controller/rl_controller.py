@@ -14,7 +14,7 @@ from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, set_ev_cls
 from ryu.lib import hub
 from ryu.ofproto import ofproto_v1_3
-from ryu.lib.packet import packet, ethernet, ipv4
+from ryu.lib.packet import packet, ethernet, ipv4, arp
 
 # Import ActorCritic implementation — keep the same import you used earlier.
 # Adjust if your PYTHONPATH differs.
@@ -210,9 +210,34 @@ class RLDCController(app_manager.RyuApp):
 
         # ARP: flood (fast path) so hosts can learn each other's MACs
         if eth and eth.ethertype == 0x0806:  # ARP
-            self.logger.info("ARP %s -> broadcasting across all switches", dp_packetin.id)
+            arp_pkt = pkt.get_protocol(arp.arp)
+            if not arp_pkt:
+                return
+
+            target_ip = arp_pkt.dst_ip
+            src_dp = dp_packetin
+            src_dpid = src_dp.id
+            in_port = msg.match.get('in_port')
 
             data = msg.data if msg.buffer_id == ofp_pi.OFP_NO_BUFFER else None
+
+            # If we know destination leaf, send only to that leaf's host port(s)
+            dst_leaf = HOST_TO_LEAF.get(target_ip)
+            if dst_leaf and src_dpid == dst_leaf:
+                print("Destination:",dst_leaf, "Source:",src_dpid)
+                dp_target = self.datapaths.get(dst_leaf)
+                if dp_target:
+                    host_ports = [HOST_PORT[ip] for ip, leaf in HOST_TO_LEAF.items() if leaf == dst_leaf]
+                    actions = [dp_target.ofproto_parser.OFPActionOutput(p) for p in host_ports]
+                    out = dp_target.ofproto_parser.OFPPacketOut(
+                        datapath=dp_target,
+                        buffer_id=dp_target.ofproto.OFP_NO_BUFFER,
+                        in_port=dp_target.ofproto.OFPP_CONTROLLER,
+                        actions=actions,
+                        data=data
+                    )
+                    dp_target.send_msg(out)
+                return
 
             # Broadcast to ALL datapaths (all switches)
             for dpid, dp in list(self.datapaths.items()):

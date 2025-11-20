@@ -12,14 +12,14 @@ def start_iperf_server(host):
     """Starts an iperf server on a given Mininet host in the background."""
     info(f"*** Starting iperf server on {host.name} ({host.IP()})\n")
     # Use host.cmd() to run iperf server in the background
-    host.cmd("iperf -s -p 5001 > /tmp/iperf-server-log-{}.txt 2>&1 &".format(host.name))
+    host.cmd("iperf3 -s -p 5001 > /tmp/iperf-server-log-{}.txt 2>&1 &".format(host.name))
 
 def stop_all_iperf_servers(net):
     """Stops all running iperf processes on all hosts."""
     info("*** Stopping all iperf processes...\n")
     for host in net.hosts:
         # Kill any existing iperf processes
-        host.cmd("killall -9 iperf")
+        host.cmd("killall -9 iperf3")
 
 def run_traffic_flow(src_host, dst_ip, duration_sec, bandwidth):
     """
@@ -28,7 +28,7 @@ def run_traffic_flow(src_host, dst_ip, duration_sec, bandwidth):
     This function is executed in a separate thread.
     """
     cmd = (
-        f"iperf -c {dst_ip} -p 5001 -t {duration_sec} -b {bandwidth} "
+        f"iperf3 -c {dst_ip} -p 5001 -t {duration_sec} -b {bandwidth} "
         f"-y C > /dev/null 2>&1" # -y C for CSV output, redirected to null
     )
     

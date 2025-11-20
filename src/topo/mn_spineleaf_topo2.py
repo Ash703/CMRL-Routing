@@ -9,6 +9,7 @@ from mininet.link import TCLink
 from mininet.log import setLogLevel
 from mininet.log import info
 from mininet.cli import CLI
+from TrafficSimulator import generate_traffic
 
 # from traffic_gen2 import generate_traffic
 
@@ -71,6 +72,7 @@ def create_mininet_network(config_file, ctrl="127.0.0.1"):
     # generate_traffic(net)   # run your custom traffic patterns
 
     # info("*** Dropping to CLI\n")
+    generate_traffic(net)
 
     CLI(net)
 

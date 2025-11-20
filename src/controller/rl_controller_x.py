@@ -28,7 +28,7 @@ from ryu.ofproto import ofproto_v1_3
 from ryu.lib.packet import packet, ethernet, ipv4, arp
 
 # RL model: keep unchanged (controller expects policy(state_np) -> (probs, action_idx))
-from src.rl.rl_model import ActorCritic
+from src.rl.rl_model_x import ActorCritic
 
 # ---------------------------
 # Config (tweak as required)
@@ -164,6 +164,7 @@ class RLDCController(app_manager.RyuApp):
                 try:
                     self._request_port_stats(dp)
                     self._request_flow_stats(dp)
+                    self._request_group_stats(dp)
                 except Exception as e:
                     self.logger.exception("Error requesting stats: %s", e)
             hub.sleep(POLL_INTERVAL)
@@ -179,6 +180,11 @@ class RLDCController(app_manager.RyuApp):
         req = parser.OFPFlowStatsRequest(datapath)
         datapath.send_msg(req)
 
+    def _request_group_stats(self, datapath):
+        parser = datapath.ofproto_parser
+        ofp = datapath.ofproto
+        req = parser.OFPGroupStatsRequest(datapath, 0, ofp.OFPG_ALL)
+        datapath.send_msg(req)
     # -------------------------
     # Flow stats reply: update cache AND run elephant detection (polling-based)
     # -------------------------
@@ -306,73 +312,87 @@ class RLDCController(app_manager.RyuApp):
                         # skip this stat entry on any unexpected issue
                         continue
                 
-                # --- cleanup loop for currently promoted flows (on this leaf) ---
-                # parameters:
-                MISSING_LIMIT = 10      # number of consecutive polls a flow can be absent before removal
-                INACTIVITY_LIMIT = 15   # number of consecutive polls with zero delta before removal
-
-                # iterate only promoted flows relevant to this dpid
-                with self.lock:
-                    promoted_keys = [k for k in self.promoted_meta.keys() if k[1] == dpid]
-
-                for flow_id_key in promoted_keys:
-                    try:
-                        meta = None
-                        with self.lock:
-                            meta = self.promoted_meta.get(flow_id_key)
-                        if meta is None:
-                            continue
-                        gid = meta['gid']
-
-                        # find corresponding stat for this flow in stats_snapshot
-                        found = False
-                        current_bytes = None
-                        for s in stats_snapshot:
-                            try:
-                                mm = getattr(s, 'match', {}) or {}
-                                self.logger.info("mm: %s",mm)
-                                if mm.get('ipv4_src') == flow_id_key[0][0] and mm.get('ipv4_dst') == flow_id_key[0][1]:
-                                    current_bytes = int(getattr(s, 'byte_count', 0) or 0)
-                                    found = True
-                                    break
-                            except Exception:
-                                continue
-                        # self.logger.info("found: %s, current bytes: %s, promoted: %s",found,current_bytes,self.promoted_flows)
-                        if not found:
-                            # not present this poll
-                            with self.lock:
-                                self.promoted_meta[flow_id_key]['missing'] = self.promoted_meta[flow_id_key].get('missing', 0) + 1
-                            if self.promoted_meta[flow_id_key]['missing'] >= MISSING_LIMIT:
-                                self.logger.info("Missing Promoted flow %s missing for %d polls -> removing promotion",
-                                                 flow_id_key, self.promoted_meta[flow_id_key]['missing'])
-                                self._remove_promotion(flow_id_key)
-                            continue
-
-                        # present -> reset missing counter
-                        with self.lock:
-                            self.promoted_meta[flow_id_key]['missing'] = 0
-
-                        # check inactivity (no byte delta)
-                        last_bytes = meta.get('last_bytes', 0)
-                        self.logger.info("found: %s, current bytes: %s, last bytes: %s, promoted: %s",found,current_bytes,last_bytes,self.promoted_flows)
-                        delta_bytes = max(0, current_bytes - last_bytes)
-                        if delta_bytes == 0:
-                            with self.lock:
-                                self.promoted_meta[flow_id_key]['inactive'] = self.promoted_meta[flow_id_key].get('inactive', 0) + 1
-                        else:
-                            with self.lock:
-                                self.promoted_meta[flow_id_key]['inactive'] = 0
-                                self.promoted_meta[flow_id_key]['last_bytes'] = current_bytes
-
-                        if self.promoted_meta[flow_id_key]['inactive'] >= INACTIVITY_LIMIT:
-                            self.logger.info("Inactive Promoted flow %s inactive for %d polls -> removing promotion",
-                                             flow_id_key, self.promoted_meta[flow_id_key]['inactive'])
-                            self._remove_promotion(flow_id_key)
-
-                    except Exception:
-                        self.logger.exception("Error while cleaning promoted flow %s", flow_id_key)
         except Exception:
             self.logger.exception("Error during polling-based promotion handling for dpid %s", dpid)
+
+    @set_ev_cls(ofp_event.EventOFPGroupStatsReply, MAIN_DISPATCHER)
+    def _group_stats_reply(self, ev):
+        dpid = ev.msg.datapath.id
+        # snapshot group stats indexed by group_id for O(1) lookup
+        stats_snapshot = list(ev.msg.body)
+        group_by_gid = {}
+        for st in stats_snapshot:
+            try:
+                gid = int(getattr(st, "group_id", None))
+                # some implementations provide byte_count/packet_count directly on st
+                byte_count = int(getattr(st, "byte_count", 0) or 0)
+                group_by_gid[gid] = byte_count
+            except Exception:
+                continue
+        # --- cleanup loop for currently promoted flows (on this leaf) ---
+        # parameters:
+        MISSING_LIMIT = 2      # number of consecutive polls a flow can be absent before removal
+        INACTIVITY_LIMIT = 3   # number of consecutive polls with zero delta before removal
+
+        # iterate only promoted flows relevant to this dpid
+        with self.lock:
+            promoted_keys = [k for k in self.promoted_meta.keys() if k[1] == dpid]
+
+        for flow_id_key in promoted_keys:
+            try:
+                with self.lock:
+                    meta = self.promoted_meta.get(flow_id_key)
+                if meta is None:
+                    continue
+
+                gid = int(meta.get("gid"))
+                current_bytes = 0
+                # attempt to read group byte_count directly by gid
+                if gid in group_by_gid:
+                    current_bytes = group_by_gid[gid]
+                    # found -> reset missing
+                    with self.lock:
+                        self.promoted_meta[flow_id_key]['missing'] = 0
+                else:
+                    # group not present in this reply (maybe switch didn't include it)
+                    with self.lock:
+                        self.promoted_meta[flow_id_key]['missing'] = self.promoted_meta[flow_id_key].get('missing', 0) + 1
+                        missing_cnt = self.promoted_meta[flow_id_key]['missing']
+                    if missing_cnt >= MISSING_LIMIT:
+                        self.logger.info("Missing Promoted flow %s missing for %d polls -> removing promotion",
+                                        flow_id_key, missing_cnt)
+                        self._remove_promotion(flow_id_key)
+                    # done with this flow for this poll
+                    continue
+
+                # Now we have current_bytes (from group stats). Compute delta vs last_bytes.
+                last_bytes = 0
+                with self.lock:
+                    last_bytes = int(self.promoted_meta[flow_id_key].get('last_bytes', 0))
+
+                self.logger.info("currrent bytes: %s, last bytes: %s, promoted meta: %s",current_bytes,last_bytes,self.promoted_meta)
+
+                delta_bytes = max(0, int(current_bytes) - int(last_bytes))
+
+                if delta_bytes == 0:
+                    with self.lock:
+                        self.promoted_meta[flow_id_key]['inactive'] = self.promoted_meta[flow_id_key].get('inactive', 0) + 1
+                else:
+                    with self.lock:
+                        self.promoted_meta[flow_id_key]['inactive'] = 0
+                        # update last_bytes to the latest observed group byte_count
+                        self.promoted_meta[flow_id_key]['last_bytes'] = int(current_bytes)
+
+                # if it has been inactive for too long, remove promotion
+                with self.lock:
+                    inactive_cnt = self.promoted_meta[flow_id_key].get('inactive', 0)
+                if inactive_cnt >= INACTIVITY_LIMIT:
+                    self.logger.info("Inactive Promoted flow %s inactive for %d polls -> removing promotion",
+                                    flow_id_key, inactive_cnt)
+                    self._remove_promotion(flow_id_key)
+
+            except Exception:
+                self.logger.exception("Error while cleaning promoted flow %s", flow_id_key)
 
     # -------------------------
     # Port stats reply
@@ -870,6 +890,7 @@ class RLDCController(app_manager.RyuApp):
             dpid = meta.get('dpid')
             # remove from sets/maps
             self.promoted_flows.discard(flow_id_key)
+            self.flow_prev_bytes[flow_id_key] = None
             try:
                 del self.promoted_meta[flow_id_key]
             except KeyError:

@@ -1,4 +1,3 @@
-# src/controller/rl_ryu_controller_final.py
 """
 Final patched Ryu controller for the YAML leaf-spine topology.
 Features:
@@ -20,6 +19,8 @@ import numpy as np
 from collections import deque
 from threading import Lock
 import os
+import yaml
+from utils import Network
 
 from ryu.base import app_manager
 from ryu.controller import ofp_event
@@ -52,27 +53,53 @@ BETA  = 1.0   # utilization skew penalty
 GAMMA = 1.0   # packet loss penalty
 DELTA = 0.0   # latency penalty (0 by default)
 
-# Topology mapping (from your YAML)
-LEAF_SPINE_PORTS = {21: [1, 2], 22: [1, 2], 23: [1, 2]}   # leaf -> [uplink ports to spines]
-HOST_TO_LEAF = {
-    "10.1.1.1": 21, "10.1.1.2": 21,
-    "10.1.1.3": 22, "10.1.1.4": 22,
-    "10.1.1.5": 23, "10.1.1.6": 23,
-}
-HOST_PORT = {
-    "10.1.1.1": 3, "10.1.1.2": 4,
-    "10.1.1.3": 3, "10.1.1.4": 4,
-    "10.1.1.5": 3, "10.1.1.6": 4,
-}
+config_file = os.environ.get("NETWORK_CONFIG_FILE", "network_config2.yaml")
+net = Network(config_file)
 
-# Spine ordering: candidate_ports order -> spine dpids
-SPINES = [11, 12]
+with open(config_file) as f:
+    raw_cfg = yaml.safe_load(f)
 
-# SPINE -> leaf port mapping (from YAML links)
-SPINE_TO_LEAF_PORTS = {
-    11: {21: 1, 22: 2, 23: 3},
-    12: {21: 1, 22: 2, 23: 3},
-}
+HOST_TO_LEAF = {}
+HOST_PORT = {}
+
+for host in raw_cfg["hosts"]:
+    ip = host["ip"]
+    leaf_name = host["connected_to"]
+    port = host["port"]
+
+    # find leaf dpid using switch_mapping equivalent:
+    leaf_dpid = next(
+        sw["id"] for sw in raw_cfg["switches"] if sw["name"] == leaf_name
+    )
+
+    HOST_TO_LEAF[ip] = leaf_dpid
+    HOST_PORT[ip] = port
+
+SPINES = net.spines[:]
+
+# Build LEAF_SPINE_PORTS aligned to SPINES ordering
+LEAF_SPINE_PORTS = {}
+
+for leaf in net.leaves:
+    ports = []
+    for spine in net.spines:
+        # Look for leaf -> spine link
+        port = None
+        if (leaf, spine) in net.links:
+            port = net.links[(leaf, spine)]["port"]
+        ports.append(port)  # may be None if topology is missing a link
+    LEAF_SPINE_PORTS[leaf] = ports
+
+SPINE_TO_LEAF_PORTS = {}
+
+for spine in net.spines:
+    leaf_ports = {}
+    for leaf in net.leaves:
+        if (spine, leaf) in net.links:
+            leaf_ports[leaf] = net.links[(spine, leaf)]["port"]
+    SPINE_TO_LEAF_PORTS[spine] = leaf_ports
+
+print(HOST_PORT,HOST_TO_LEAF,SPINES,LEAF_SPINE_PORTS,SPINE_TO_LEAF_PORTS)
 
 class RLDCController(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
@@ -486,11 +513,13 @@ class RLDCController(app_manager.RyuApp):
 
             # If we know destination leaf, send only to that leaf's host port(s)
             dst_leaf = HOST_TO_LEAF.get(target_ip)
+            
             if dst_leaf and src_dpid == dst_leaf:
-                # print("Destination:",dst_leaf, "Source:",src_dpid)
+                # self.logger.info("Destination: %s, Source: %s",dst_leaf,src_dpid)
                 dp_target = self.datapaths.get(dst_leaf)
                 if dp_target:
                     host_ports = [HOST_PORT[ip] for ip, leaf in HOST_TO_LEAF.items() if leaf == dst_leaf]
+                    print(host_ports)
                     actions = [dp_target.ofproto_parser.OFPActionOutput(p) for p in host_ports]
                     out = dp_target.ofproto_parser.OFPPacketOut(
                         datapath=dp_target,
@@ -502,8 +531,9 @@ class RLDCController(app_manager.RyuApp):
                     dp_target.send_msg(out)
                 return
 
-            if src_dpid in SPINE_TO_LEAF_PORTS:
-                # print("Destination:",dst_leaf, "Source:",src_dpid)
+            if src_dpid in SPINES:
+                # print(SPINES)
+                # self.logger.info("Destination: %s, Source: %s",dst_leaf,src_dpid)
                 target_port = SPINE_TO_LEAF_PORTS[src_dpid][dst_leaf]
                 actions = [src_dp.ofproto_parser.OFPActionOutput(target_port)]
                 out = src_dp.ofproto_parser.OFPPacketOut(
@@ -517,7 +547,7 @@ class RLDCController(app_manager.RyuApp):
                 return
             
             #send to both spines
-            # print("Destination:",dst_leaf, "Source:",src_dpid)
+            # self.logger.info("Destination: %s, Source: %s",dst_leaf,src_dpid)
             target_ports = LEAF_SPINE_PORTS[src_dpid]
             actions = [src_dp.ofproto_parser.OFPActionOutput(target_port) for target_port in target_ports]
             out = src_dp.ofproto_parser.OFPPacketOut(
@@ -606,6 +636,7 @@ class RLDCController(app_manager.RyuApp):
 
         # policy (keeps the RL model unchanged)
         probs, action_idx = self.model.policy(state_np)
+        self.logger.info("probs: %s",probs)
 
         # ensure dp_ing exists
         dp_ing = self.datapaths.get(ingress_leaf)

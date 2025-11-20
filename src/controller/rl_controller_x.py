@@ -19,6 +19,7 @@ import time
 import numpy as np
 from collections import deque
 from threading import Lock
+import os
 
 from ryu.base import app_manager
 from ryu.controller import ofp_event
@@ -31,7 +32,7 @@ from ryu.lib.packet import packet, ethernet, ipv4, arp
 from src.rl.rl_model_x import ActorCritic
 
 # ---------------------------
-# Config (tweak as required)
+# Config
 # ---------------------------
 POLL_INTERVAL = 2.0                 # seconds between port/flow polls
 ELEPHANT_BYTES = 2 * 1024 * 1024    # 2 MB promotion threshold
@@ -41,6 +42,9 @@ TRAIN_BATCH_SIZE = 8
 DEVICE = 'cpu'
 FLOW_IDLE_TIMEOUT = 30              # seconds idle timeout for per-flow rules
 GROUP_IDLE_TIMEOUT = 300            # seconds to keep unused groups before deletion
+
+CHECKPOINT_DIR = "checkpoints"
+MODEL_SAVE_STEPS = 1
 
 # Reward coefficients (alpha, beta, gamma, delta)
 ALPHA = 1.0   # throughput gain weight
@@ -91,10 +95,20 @@ class RLDCController(app_manager.RyuApp):
 
         self.lock = Lock()
 
-        # RL model (unchanged)
+        # RL model
         num_paths = len(SPINES)
         #[util1,drop1,util2,drop2]
         self.model = ActorCritic(input_dim=num_paths*2, num_actions=num_paths, device=DEVICE)
+        self.rl_update_step = 0
+        SAVE_PATH = f"{CHECKPOINT_DIR}/rl_latest.pt"
+        os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+
+        try:
+            self.model.load_checkpoint(SAVE_PATH, map_location=DEVICE)
+            self.logger.info("Loaded RL model from %s", SAVE_PATH)
+        except Exception:
+            self.logger.info("No saved RL model, starting fresh")
+
 
         # threads
         self.monitor_thread = hub.spawn(self._monitor)
@@ -870,6 +884,16 @@ class RLDCController(app_manager.RyuApp):
                         self.logger.info("RL update: actor_loss=%.4f critic_loss=%.4f", actor_loss, critic_loss)
                     except Exception:
                         pass
+
+                    # ---- SAVE MODEL ----
+                    try:
+                        self.rl_update_step += 1
+                        if self.rl_update_step % MODEL_SAVE_STEPS == 0:
+                            self.model.save_checkpoint(f"{CHECKPOINT_DIR}/rl_latest.pt")
+                            self.logger.info("[RL] Model saved to checkpoints/rl_latest.pt")
+                    except Exception as e:
+                        self.logger.error("Failed to save RL model: %s", e)
+                    
             hub.sleep(POLL_INTERVAL)
 
     # -------------------------

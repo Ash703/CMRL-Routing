@@ -93,7 +93,8 @@ class RLDCController(app_manager.RyuApp):
 
         # RL model (unchanged)
         num_paths = len(SPINES)
-        self.model = ActorCritic(input_dim=num_paths, num_actions=num_paths, device=DEVICE)
+        #[util1,drop1,util2,drop2]
+        self.model = ActorCritic(input_dim=num_paths*2, num_actions=num_paths, device=DEVICE)
 
         # threads
         self.monitor_thread = hub.spawn(self._monitor)
@@ -257,8 +258,12 @@ class RLDCController(app_manager.RyuApp):
                                 state_list = []
                                 with self.lock:
                                     for p in candidate_ports:
-                                        util = self.port_stats.get(ingress_leaf, {}).get(p, {}).get('util', 0.0)
+                                        entry = self.port_stats.get(ingress_leaf, {}).get(p, {})
+                                        util = entry.get('util', 0.0)
+                                        drop = float(entry.get('tx_dropped_delta', 0) + entry.get('rx_dropped_delta', 0)) 
+                                        loss = min(drop / 1000.0, 1.0)
                                         state_list.append(min(util / CAPACITY_Mbps, 1.0))
+                                        state_list.append(loss)
                                 state_np = np.array(state_list, dtype=np.float32)
                                 probs, _ = self.model.policy(state_np)
                                 flow_key = (src,dst)
@@ -574,9 +579,13 @@ class RLDCController(app_manager.RyuApp):
         with self.lock:
             state = []
             for p in candidate_ports:
-                util = self.port_stats.get(ingress_leaf, {}).get(p, {}).get('util', 0.0)
+                entry = self.port_stats.get(ingress_leaf, {}).get(p, {})
+                util = entry.get('util', 0.0)
+                drop = float(entry.get('tx_dropped_delta', 0) + entry.get('rx_dropped_delta', 0)) 
+                loss = min(drop / 1000.0, 1.0)
                 state.append(min(util / CAPACITY_Mbps, 1.0))
-        state_np = np.array(state, dtype=np.float32)
+                state.append(loss)
+            state_np = np.array(state, dtype=np.float32)
 
         # elephant detection hint (legacy). Promotion is performed by polling.
         # is_elephant = self._is_elephant(flow_key, ingress_leaf)
@@ -835,7 +844,14 @@ class RLDCController(app_manager.RyuApp):
                         dpid = meta['dpid']
                         candidate_ports = meta['candidate_ports']
                         with self.lock:
-                            next_state = [min(self.port_stats.get(dpid, {}).get(p, {}).get('util', 0.0) / CAPACITY_Mbps, 1.0) for p in candidate_ports]
+                            next_state = []#[min(self.port_stats.get(dpid, {}).get(p, {}).get('util', 0.0) / CAPACITY_Mbps, 1.0) for p in candidate_ports]
+                            for p in candidate_ports:
+                                        entry = self.port_stats.get(dpid, {}).get(p, {})
+                                        util = entry.get('util', 0.0)
+                                        drop = float(entry.get('tx_dropped_delta', 0) + entry.get('rx_dropped_delta', 0)) 
+                                        loss = min(drop / 1000.0, 1.0)
+                                        next_state.append(min(util / CAPACITY_Mbps, 1.0))
+                                        next_state.append(loss)
                         next_state_np = np.array(next_state, dtype=np.float32)
                         done = False
                         logp_placeholder = None

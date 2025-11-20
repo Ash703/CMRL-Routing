@@ -46,8 +46,7 @@ FLOW_IDLE_TIMEOUT = 30              # seconds idle timeout for per-flow rules
 GROUP_IDLE_TIMEOUT = 300            # seconds to keep unused groups before deletion
 
 CHECKPOINT_DIR = "checkpoints"
-MODEL_SAVE_STEPS = 1
-
+MODEL_SAVE_STEPS = 20
 
 # Reward coefficients (alpha, beta, gamma, delta)
 ALPHA = 1.0   # throughput gain weight
@@ -475,6 +474,10 @@ class RLDCController(app_manager.RyuApp):
                     tx_dropped_delta = 0
                     rx_dropped_delta = 0
 
+                # with open(f"{CHECKPOINT_DIR}/port_util_log.csv", "a", newline="") as f:
+                #     writer = csv.writer(f)
+                #     writer.writerow([time.time(), dpid, p, util, tx_dropped_delta, rx_dropped_delta])
+
                 self.port_stats[dpid][p] = {
                     'tx': stat.tx_bytes,
                     'rx': stat.rx_bytes,
@@ -521,7 +524,7 @@ class RLDCController(app_manager.RyuApp):
                 dp_target = self.datapaths.get(dst_leaf)
                 if dp_target:
                     host_ports = [HOST_PORT[ip] for ip, leaf in HOST_TO_LEAF.items() if leaf == dst_leaf]
-                    print(host_ports)
+                    # print(host_ports)
                     actions = [dp_target.ofproto_parser.OFPActionOutput(p) for p in host_ports]
                     out = dp_target.ofproto_parser.OFPPacketOut(
                         datapath=dp_target,
@@ -863,7 +866,7 @@ class RLDCController(app_manager.RyuApp):
 
         reward = (ALPHA * flow_throughput_norm) - (BETA * util_skew) - (GAMMA * packet_loss_norm) - (DELTA * latency_penalty)
         reward = max(-1.0, min(1.0, reward))
-        with open("rl_reward_log.csv", "a", newline="") as f:
+        with open(f"{CHECKPOINT_DIR}/rl_reward_log.csv", "a", newline="") as f:
             writer = csv.writer(f)
             writer.writerow([time.time(), reward])
         return reward
@@ -877,7 +880,8 @@ class RLDCController(app_manager.RyuApp):
                     meta = self.flow_memory.get(k)
                 if not meta:
                     continue
-                if time.time() - meta['time'] >= max(1.5, POLL_INTERVAL):
+                now = time.time()
+                if now - meta['time'] >= max(1.5, POLL_INTERVAL):
                     r = self._compute_reward(k, meta)
                     if r is not None:
                         s = meta['state']
@@ -896,16 +900,21 @@ class RLDCController(app_manager.RyuApp):
                         with self.lock:
                             next_state = []#[min(self.port_stats.get(dpid, {}).get(p, {}).get('util', 0.0) / CAPACITY_Mbps, 1.0) for p in candidate_ports]
                             for p in candidate_ports:
-                                        entry = self.port_stats.get(dpid, {}).get(p, {})
-                                        util = entry.get('util', 0.0)
-                                        drop = float(entry.get('tx_dropped_delta', 0) + entry.get('rx_dropped_delta', 0)) 
-                                        loss = min(drop / 1000.0, 1.0)
-                                        next_state.append(min(util / CAPACITY_Mbps, 1.0))
-                                        next_state.append(loss)
+                                entry = self.port_stats.get(dpid, {}).get(p, {})
+                                util = entry.get('util', 0.0)
+                                drop = float(entry.get('tx_dropped_delta', 0) + entry.get('rx_dropped_delta', 0)) 
+                                loss = min(drop / 1000.0, 1.0)
+                                next_state.append(min(util / CAPACITY_Mbps, 1.0))
+                                next_state.append(loss)
                         next_state_np = np.array(next_state, dtype=np.float32)
                         done = False
                         logp_placeholder = None
                         self.transitions.append((s, a_probs, r, next_state_np, done, logp_placeholder))
+                        with open(f"{CHECKPOINT_DIR}/rl_actions_log.csv", "a", newline="") as f:
+                            writer = csv.writer(f)
+                            probs_list = a_probs.tolist()
+                            writer.writerow([meta['time'], meta['flow_key'][0], meta['flow_key'][1], meta['type'], *probs_list])
+
                         with self.lock:
                             try:
                                 del self.flow_memory[k]
@@ -918,7 +927,7 @@ class RLDCController(app_manager.RyuApp):
                     try:
                         actor_loss, critic_loss = res
                         self.logger.info("RL update: actor_loss=%.4f critic_loss=%.4f", actor_loss, critic_loss)
-                        with open("rl_training_log.csv", "a", newline="") as f:
+                        with open(f"{CHECKPOINT_DIR}/rl_training_log.csv", "a", newline="") as f:
                             writer = csv.writer(f)
                             writer.writerow([time.time(), actor_loss, critic_loss])
 

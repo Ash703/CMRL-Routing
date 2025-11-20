@@ -4,7 +4,7 @@ venv/
 .venv/
 
 .sdn_lab/
-checkpoints/
+checkpoints*/
 
 .vscode/
 

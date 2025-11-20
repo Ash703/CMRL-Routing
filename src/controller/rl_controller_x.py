@@ -64,7 +64,7 @@ HOST_PORT = {
 # Spine ordering: candidate_ports order -> spine dpids
 SPINES = [11, 12]
 
-# SPINE -> leaf port mapping (from your YAML links)
+# SPINE -> leaf port mapping (from YAML links)
 SPINE_TO_LEAF_PORTS = {
     11: {21: 1, 22: 2, 23: 3},
     12: {21: 1, 22: 2, 23: 3},
@@ -267,7 +267,8 @@ class RLDCController(app_manager.RyuApp):
                                     'flow_key': flow_key,
                                     'dpid': ingress_leaf,
                                     'state': state_np,
-                                    'action_idx': chosen_idx,
+                                    'action_probs': probs.copy() if isinstance(probs, np.ndarray) else np.array(probs, dtype=np.float32),
+                                    'chosen_idx': chosen_idx,
                                     'time': time.time(),
                                     'type': 'elephant',
                                     'candidate_ports': candidate_ports
@@ -340,6 +341,7 @@ class RLDCController(app_manager.RyuApp):
 
         for flow_id_key in promoted_keys:
             try:
+                meta = None
                 with self.lock:
                     meta = self.promoted_meta.get(flow_id_key)
                 if meta is None:
@@ -373,6 +375,8 @@ class RLDCController(app_manager.RyuApp):
                 self.logger.info("currrent bytes: %s, last bytes: %s, promoted meta: %s",current_bytes,last_bytes,self.promoted_meta)
 
                 delta_bytes = max(0, int(current_bytes) - int(last_bytes))
+                # update last_bytes to the latest observed group byte_count
+                self.promoted_meta[flow_id_key]['last_bytes'] = int(current_bytes)
 
                 if delta_bytes == 0:
                     with self.lock:
@@ -380,8 +384,6 @@ class RLDCController(app_manager.RyuApp):
                 else:
                     with self.lock:
                         self.promoted_meta[flow_id_key]['inactive'] = 0
-                        # update last_bytes to the latest observed group byte_count
-                        self.promoted_meta[flow_id_key]['last_bytes'] = int(current_bytes)
 
                 # if it has been inactive for too long, remove promotion
                 with self.lock:
@@ -654,7 +656,8 @@ class RLDCController(app_manager.RyuApp):
             'flow_key': flow_key,
             'dpid': ingress_leaf,
             'state': state_np,
-            'action_idx': chosen_idx,
+            'action_probs': probs.copy() if isinstance(probs, np.ndarray) else np.array(probs, dtype=np.float32),
+            'chosen_idx': chosen_idx,
             'time': time.time(),
             'type': flow_type,
             'candidate_ports': candidate_ports
@@ -819,7 +822,16 @@ class RLDCController(app_manager.RyuApp):
                     r = self._compute_reward(k, meta)
                     if r is not None:
                         s = meta['state']
-                        a = meta['action_idx']
+                        # a = meta['action_idx']
+                        a_probs = meta['action_probs']
+                        # Convert to a deterministic dtype (plain numpy float32) so the queue stores serializable objects
+                        if a_probs is None:
+                            # fallback: build one-hot from chosen_idx
+                            chosen_idx = int(meta.get('chosen_idx', 0))
+                            a_probs = np.zeros(len(meta['candidate_ports']), dtype=np.float32)
+                            a_probs[chosen_idx] = 1.0
+                        else:
+                            a_probs = np.asarray(a_probs, dtype=np.float32)
                         dpid = meta['dpid']
                         candidate_ports = meta['candidate_ports']
                         with self.lock:
@@ -827,7 +839,7 @@ class RLDCController(app_manager.RyuApp):
                         next_state_np = np.array(next_state, dtype=np.float32)
                         done = False
                         logp_placeholder = None
-                        self.transitions.append((s, a, r, next_state_np, done, logp_placeholder))
+                        self.transitions.append((s, a_probs, r, next_state_np, done, logp_placeholder))
                         with self.lock:
                             try:
                                 del self.flow_memory[k]

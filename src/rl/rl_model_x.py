@@ -88,7 +88,13 @@ class ActorCritic:
 
         # Batch data
         states = torch.tensor(np.vstack([t[0] for t in transitions]), dtype=torch.float32, device=self.device)
-        actions = torch.tensor([t[1] for t in transitions], dtype=torch.long, device=self.device)
+        # actions = torch.tensor([t[1] for t in transitions], dtype=torch.long, device=self.device)
+        # t[1] is now the probability vector array
+        actions_probs = torch.tensor(
+            np.vstack([t[1] for t in transitions]),
+            dtype=torch.float32,
+            device=self.device
+        )  # shape (batch, num_actions)
         rewards = torch.tensor([t[2] for t in transitions], dtype=torch.float32, device=self.device)
         next_states = torch.tensor(np.vstack([t[3] for t in transitions]), dtype=torch.float32, device=self.device)
         dones = torch.tensor([t[4] for t in transitions], dtype=torch.float32, device=self.device)
@@ -103,10 +109,13 @@ class ActorCritic:
 
         # Compute current policy log-probs and entropy
         logits = self.actor(states)                    # (batch, num_actions)
-        probs = torch.softmax(logits, dim=-1)          # (batch, num_actions)
-        m = torch.distributions.Categorical(probs)
-        logps = m.log_prob(actions)                    # (batch,)
-        entropy = m.entropy().mean()
+        probs_pred = torch.softmax(logits, dim=-1)          # (batch, num_actions)
+        # m = torch.distributions.Categorical(probs)
+        # logps = m.log_prob(actions)                    # (batch,)
+        entropy = -(probs_pred * torch.log(probs_pred + 1e-8)).sum(dim=1).mean()
+        log_probs_pred = torch.log(probs_pred + 1e-8)       # (batch, num_actions)
+        logps = (actions_probs * log_probs_pred).sum(dim=1)  # batch of log-prob expectations
+        # entropy = m.entropy().mean()
 
         # Advantage
         advantage = (target - vals).detach()           # (batch,)

@@ -30,6 +30,18 @@ switches:
   - name: s26
     id: 26
     type: leaf
+  - name: s27
+    id: 27
+    type: leaf
+  - name: s28
+    id: 28
+    type: leaf
+  - name: s29
+    id: 29
+    type: leaf
+  - name: s30
+    id: 30
+    type: leaf
 
 hosts:
   - name: h1
@@ -110,6 +122,58 @@ hosts:
     connected_to: s26
     port: 4
 
+  - name: h13
+    ip: 10.1.1.13
+    mac: 00:00:00:00:00:0D
+    default_route: "via 10.1.1.100"
+    connected_to: s27
+    port: 3
+  - name: h14
+    ip: 10.1.1.14
+    mac: 00:00:00:00:00:0E
+    default_route: "via 10.1.1.100"
+    connected_to: s27
+    port: 4
+
+  - name: h15
+    ip: 10.1.1.15
+    mac: 00:00:00:00:00:0F
+    default_route: "via 10.1.1.100"
+    connected_to: s28
+    port: 3
+  - name: h16
+    ip: 10.1.1.16
+    mac: 00:00:00:00:00:10
+    default_route: "via 10.1.1.100"
+    connected_to: s28
+    port: 4
+
+  - name: h17
+    ip: 10.1.1.17
+    mac: 00:00:00:00:00:11
+    default_route: "via 10.1.1.100"
+    connected_to: s29
+    port: 3
+  - name: h18
+    ip: 10.1.1.18
+    mac: 00:00:00:00:00:12
+    default_route: "via 10.1.1.100"
+    connected_to: s29
+    port: 4
+
+  - name: h19
+    ip: 10.1.1.19
+    mac: 00:00:00:00:00:13
+    default_route: "via 10.1.1.100"
+    connected_to: s30
+    port: 3
+  - name: h20
+    ip: 10.1.1.20
+    mac: 00:00:00:00:00:14
+    default_route: "via 10.1.1.100"
+    connected_to: s30
+    port: 4
+
 links:
   # spine s11 to all leaves
   - source: s11
@@ -135,6 +199,22 @@ links:
   - source: s11
     source_port: 6
     target: s26
+    target_port: 1
+  - source: s11
+    source_port: 7
+    target: s27
+    target_port: 1
+  - source: s11
+    source_port: 8
+    target: s28
+    target_port: 1
+  - source: s11
+    source_port: 9
+    target: s29
+    target_port: 1
+  - source: s11
+    source_port: 10
+    target: s30
     target_port: 1
 
   # spine s12 to all leaves
@@ -162,6 +242,22 @@ links:
     source_port: 6
     target: s26
     target_port: 2
+  - source: s12
+    source_port: 7
+    target: s27
+    target_port: 2
+  - source: s12
+    source_port: 8
+    target: s28
+    target_port: 2
+  - source: s12
+    source_port: 9
+    target: s29
+    target_port: 2
+  - source: s12
+    source_port: 10
+    target: s30
+    target_port: 2
 
   # spine s13 to all leaves
   - source: s13
@@ -188,6 +284,22 @@ links:
     source_port: 6
     target: s26
     target_port: 3
+  - source: s13
+    source_port: 7
+    target: s27
+    target_port: 3
+  - source: s13
+    source_port: 8
+    target: s28
+    target_port: 3
+  - source: s13
+    source_port: 9
+    target: s29
+    target_port: 3
+  - source: s13
+    source_port: 10
+    target: s30
+    target_port: 3
 
   # spine s14 to all leaves
   - source: s14
@@ -213,4 +325,20 @@ links:
   - source: s14
     source_port: 6
     target: s26
+    target_port: 4
+  - source: s14
+    source_port: 7
+    target: s27
+    target_port: 4
+  - source: s14
+    source_port: 8
+    target: s28
+    target_port: 4
+  - source: s14
+    source_port: 9
+    target: s29
+    target_port: 4
+  - source: s14
+    source_port: 10
+    target: s30
     target_port: 4

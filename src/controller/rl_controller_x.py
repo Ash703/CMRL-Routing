@@ -85,6 +85,9 @@ class RLDCController(app_manager.RyuApp):
         self.transitions = deque(maxlen=5000)
         self.groups_last_used = {}       # (dpid, group_id) -> last_used_ts
         self.promoted_flows = set()      # set of ((src,dst), ingress_leaf) already promoted
+        # new: per-promoted-flow metadata for cleanup
+        # key: ((src,dst), ingress_leaf) -> { 'gid': int, 'last_bytes': int, 'missing': int, 'inactive': int, 'dpid': ingress_leaf }
+        self.promoted_meta = {}
 
         self.lock = Lock()
 
@@ -225,7 +228,7 @@ class RLDCController(app_manager.RyuApp):
                         self.flow_prev_bytes[key_prev] = byte_count
 
                         # condition for promotion
-                        if (delta >= ELEPHANT_BYTES or byte_count >= ELEPHANT_BYTES):
+                        if (delta >= ELEPHANT_BYTES): #or byte_count >= ELEPHANT_BYTES):
                             # only promote once per (flow, ingress_leaf)
                             if key_prev in self.promoted_flows:
                                 continue
@@ -252,6 +255,20 @@ class RLDCController(app_manager.RyuApp):
                                         state_list.append(min(util / CAPACITY_Mbps, 1.0))
                                 state_np = np.array(state_list, dtype=np.float32)
                                 probs, _ = self.model.policy(state_np)
+                                flow_key = (src,dst)
+                                chosen_idx = int(np.argmax(probs))
+                                meta = {
+                                    'flow_key': flow_key,
+                                    'dpid': ingress_leaf,
+                                    'state': state_np,
+                                    'action_idx': chosen_idx,
+                                    'time': time.time(),
+                                    'type': 'elephant',
+                                    'candidate_ports': candidate_ports
+                                }
+                                with self.lock:
+                                    self.flow_memory[flow_key] = meta
+
                             except Exception:
                                 probs = None
 
@@ -275,12 +292,85 @@ class RLDCController(app_manager.RyuApp):
                             # bookkeeping
                             with self.lock:
                                 self.promoted_flows.add(key_prev)
+                                self.promoted_meta[key_prev] = {
+                                    'gid': int(gid),
+                                    'last_bytes': int(byte_count),
+                                    'missing': 0,
+                                    'inactive': 0,
+                                    'dpid': ingress_leaf
+                                }
                                 self.groups_last_used[(ingress_leaf, gid)] = time.time()
                             self.logger.info("PROMOTED flow %s->%s on leaf %s (delta=%d bytes, abs=%d) gid=%s weights=%s",
                                              src, dst, ingress_leaf, delta, byte_count, gid, weights.tolist())
                     except Exception:
                         # skip this stat entry on any unexpected issue
                         continue
+                
+                # --- cleanup loop for currently promoted flows (on this leaf) ---
+                # parameters:
+                MISSING_LIMIT = 10      # number of consecutive polls a flow can be absent before removal
+                INACTIVITY_LIMIT = 15   # number of consecutive polls with zero delta before removal
+
+                # iterate only promoted flows relevant to this dpid
+                with self.lock:
+                    promoted_keys = [k for k in self.promoted_meta.keys() if k[1] == dpid]
+
+                for flow_id_key in promoted_keys:
+                    try:
+                        meta = None
+                        with self.lock:
+                            meta = self.promoted_meta.get(flow_id_key)
+                        if meta is None:
+                            continue
+                        gid = meta['gid']
+
+                        # find corresponding stat for this flow in stats_snapshot
+                        found = False
+                        current_bytes = None
+                        for s in stats_snapshot:
+                            try:
+                                mm = getattr(s, 'match', {}) or {}
+                                self.logger.info("mm: %s",mm)
+                                if mm.get('ipv4_src') == flow_id_key[0][0] and mm.get('ipv4_dst') == flow_id_key[0][1]:
+                                    current_bytes = int(getattr(s, 'byte_count', 0) or 0)
+                                    found = True
+                                    break
+                            except Exception:
+                                continue
+                        # self.logger.info("found: %s, current bytes: %s, promoted: %s",found,current_bytes,self.promoted_flows)
+                        if not found:
+                            # not present this poll
+                            with self.lock:
+                                self.promoted_meta[flow_id_key]['missing'] = self.promoted_meta[flow_id_key].get('missing', 0) + 1
+                            if self.promoted_meta[flow_id_key]['missing'] >= MISSING_LIMIT:
+                                self.logger.info("Missing Promoted flow %s missing for %d polls -> removing promotion",
+                                                 flow_id_key, self.promoted_meta[flow_id_key]['missing'])
+                                self._remove_promotion(flow_id_key)
+                            continue
+
+                        # present -> reset missing counter
+                        with self.lock:
+                            self.promoted_meta[flow_id_key]['missing'] = 0
+
+                        # check inactivity (no byte delta)
+                        last_bytes = meta.get('last_bytes', 0)
+                        self.logger.info("found: %s, current bytes: %s, last bytes: %s, promoted: %s",found,current_bytes,last_bytes,self.promoted_flows)
+                        delta_bytes = max(0, current_bytes - last_bytes)
+                        if delta_bytes == 0:
+                            with self.lock:
+                                self.promoted_meta[flow_id_key]['inactive'] = self.promoted_meta[flow_id_key].get('inactive', 0) + 1
+                        else:
+                            with self.lock:
+                                self.promoted_meta[flow_id_key]['inactive'] = 0
+                                self.promoted_meta[flow_id_key]['last_bytes'] = current_bytes
+
+                        if self.promoted_meta[flow_id_key]['inactive'] >= INACTIVITY_LIMIT:
+                            self.logger.info("Inactive Promoted flow %s inactive for %d polls -> removing promotion",
+                                             flow_id_key, self.promoted_meta[flow_id_key]['inactive'])
+                            self._remove_promotion(flow_id_key)
+
+                    except Exception:
+                        self.logger.exception("Error while cleaning promoted flow %s", flow_id_key)
         except Exception:
             self.logger.exception("Error during polling-based promotion handling for dpid %s", dpid)
 
@@ -763,3 +853,65 @@ class RLDCController(app_manager.RyuApp):
                     if (dpid, gid) in self.groups_last_used:
                         del self.groups_last_used[(dpid, gid)]
             hub.sleep(GROUP_IDLE_TIMEOUT / 4.0)
+
+    def _remove_promotion(self, flow_id_key):
+        """Tear down group and flow->group for a promoted flow, and clean bookkeeping.
+        flow_id_key = ((src, dst), ingress_leaf)
+        """
+        with self.lock:
+            meta = self.promoted_meta.get(flow_id_key)
+            if not meta:
+                # maybe already removed
+                if flow_id_key in self.promoted_flows:
+                    self.promoted_flows.discard(flow_id_key)
+                return
+
+            gid = int(meta.get('gid'))
+            dpid = meta.get('dpid')
+            # remove from sets/maps
+            self.promoted_flows.discard(flow_id_key)
+            try:
+                del self.promoted_meta[flow_id_key]
+            except KeyError:
+                pass
+            if (dpid, gid) in self.groups_last_used:
+                try:
+                    del self.groups_last_used[(dpid, gid)]
+                except KeyError:
+                    pass
+
+        # send Group DELETE and Flow DELETE outside lock
+        dp = self.datapaths.get(dpid)
+        if dp is None:
+            self.logger.info("Remove promotion: datapath %s not present (already gone)", dpid)
+            return
+
+        parser = dp.ofproto_parser
+        ofp = dp.ofproto
+
+        # delete group
+        try:
+            grp_del = parser.OFPGroupMod(datapath=dp, command=ofp.OFPGC_DELETE,
+                                        type_=ofp.OFPGT_ALL, group_id=gid, buckets=[])
+            dp.send_msg(grp_del)
+            self.logger.info("Deleted group %s on dpid %s for promotion removal", gid, dpid)
+        except Exception:
+            self.logger.exception("Failed to delete group %s on dpid %s", gid, dpid)
+
+        # delete flow -> group rule (match ipv4 src/dst)
+        try:
+            src_dst = flow_id_key[0]
+            src_ip, dst_ip = src_dst
+            match = parser.OFPMatch(eth_type=0x0800, ipv4_src=src_ip, ipv4_dst=dst_ip)
+            # Use command DELETE to remove matching flows
+            fm = parser.OFPFlowMod(datapath=dp,
+                                command=ofp.OFPFC_DELETE,
+                                out_port=ofp.OFPP_ANY,
+                                out_group=ofp.OFPG_ANY,
+                                match=match,
+                                table_id=0)
+            dp.send_msg(fm)
+            self.logger.info("Deleted flow->group entry for %s on dpid %s", src_dst, dpid)
+        except Exception:
+            self.logger.exception("Failed to delete flow->group entry for %s on dpid %s", src_dst, dpid)
+

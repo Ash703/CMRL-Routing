@@ -5,6 +5,7 @@ venv/
 
 .sdn_lab/
 checkpoints*/
+traffic_logs*/
 
 .vscode/
 

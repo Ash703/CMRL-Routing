@@ -42,14 +42,14 @@ CAPACITY_Mbps = 1000.0              # normalize Mbps by this (1 Gbps)
 GROUP_WEIGHT_SCALE = 100           # scale prob -> bucket weight
 TRAIN_BATCH_SIZE = 8
 DEVICE = 'cpu'
-FLOW_IDLE_TIMEOUT = 30              # seconds idle timeout for per-flow rules
+FLOW_IDLE_TIMEOUT = 5              # seconds idle timeout for per-flow rules
 GROUP_IDLE_TIMEOUT = 300            # seconds to keep unused groups before deletion
 
 CHECKPOINT_DIR = "checkpoints3"
 MODEL_SAVE_STEPS = 20
 
 # Reward coefficients (alpha, beta, gamma, delta)
-ALPHA = 1.0   # throughput gain weight
+ALPHA = 2.0   # throughput gain weight
 BETA  = 1.0   # utilization skew penalty
 GAMMA = 1.0   # packet loss penalty
 DELTA = 0.0   # latency penalty (0 by default)
@@ -419,7 +419,7 @@ class RLDCController(app_manager.RyuApp):
                 with self.lock:
                     last_bytes = int(self.promoted_meta[flow_id_key].get('last_bytes', 0))
 
-                self.logger.info("currrent bytes: %s, last bytes: %s, promoted meta: %s",current_bytes,last_bytes,self.promoted_meta)
+                # self.logger.info("currrent bytes: %s, last bytes: %s, promoted meta: %s",current_bytes,last_bytes,self.promoted_meta)
 
                 delta_bytes = max(0, int(current_bytes) - int(last_bytes))
                 # update last_bytes to the latest observed group byte_count
@@ -641,7 +641,7 @@ class RLDCController(app_manager.RyuApp):
 
         # policy (keeps the RL model unchanged)
         probs, action_idx = self.model.policy(state_np)
-        self.logger.info("probs: %s",probs)
+        # self.logger.info("probs: %s",probs)
 
         # ensure dp_ing exists
         dp_ing = self.datapaths.get(ingress_leaf)

@@ -8,3 +8,7 @@ export PYTHONPATH=$PYTHONPATH:$(pwd)
 NETWORK_CONFIG_FILE=src/network_config.yaml ryu-manager --observe-links flowmanager/flowmanager.py src/controller/dc_switch_1.py
 
 py exec("import sys; sys.path.append('/home/Ash/Documents/ACN/CMRL-Routing/src/topo'); from traffic_gen3 import start_servers, generate_traffic; start_servers(net); generate_traffic(net, num_flows=8)")
+
+sudo tc qdisc change dev s11-eth2 root netem delay 1ms loss 1%
+
+py exec("import sys; sys.path.append('/home/Ash/Documents/ACN/CMRL-Routing/src/topo'); from TrafficSimulator import generate_traffic; generate_traffic(net)")

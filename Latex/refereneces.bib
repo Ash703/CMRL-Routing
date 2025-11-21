@@ -1,0 +1,142 @@
+% --- TRADITIONAL & HEURISTIC ---
+
+
+@rfc{10.17487/RFC2992,
+author = {Hopps, C.},
+title = {RFC2992: Analysis of an Equal-Cost Multi-Path Algorithm},
+year = {2000},
+publisher = {RFC Editor},
+address = {USA},
+doi = {10.17487/RFC2992},
+abstract = {Equal-cost multi-path (ECMP) is a routing technique for routing   packets along multiple paths of equal cost.  The forwarding engine   identifies paths by next-hop.  When forwarding a packet the router   must decide which next-hop (path) to use.  This document gives an   analysis of one method for making that decision.  The analysis   includes the performance of the algorithm and the disruption caused   by changes to the set of next-hops.}
+}
+
+@inproceedings{al2008scalable,
+  title={A scalable, commodity data center network architecture},
+  author={Al-Fares, Mohammad and Loukissas, Alexander and Vahdat, Amin},
+  booktitle={Proceedings of the ACM SIGCOMM 2008 conference on Data communication},
+  pages={63--74},
+  year={2008}
+}
+
+@inproceedings{hedera,
+  title={Hedera: Dynamic Flow Scheduling for Data Center Networks.},
+  author={Al-Fares, Mohammad and Radhakrishnan, Sivasankar and Raghavan, Barath and Huang, Nelson and Vahdat, Amin},
+  booktitle={NSDI},
+  volume={10},
+  pages={19--19},
+  year={2010}
+}
+
+@inproceedings{mahout,
+  title={Mahout: Low-overhead flow management for data centers},
+  author={Curtis, Andrew R and Kim, Wonho and Yalagandula, Praveen},
+  booktitle={2011 Proceedings IEEE INFOCOM},
+  pages={2669--2677},
+  year={2011},
+  organization={IEEE}
+}
+
+% --- REINFORCEMENT LEARNING ---
+
+@INPROCEEDINGS{9481864,
+  author={Almasan, Paul and Suárez-Varela, José and Wu, Bo and Xiao, Shihan and Barlet-Ros, Pere and Cabellos-Aparicio, Albert},
+  booktitle={2021 IEEE 22nd International Conference on High Performance Switching and Routing (HPSR)}, 
+  title={Towards Real-Time Routing Optimization with Deep Reinforcement Learning: Open Challenges}, 
+  year={2021},
+  volume={},
+  number={},
+  pages={1-6},
+  doi={10.1109/HPSR52026.2021.9481864}
+}
+
+@article{drl_r,
+  title = {DRL-R: Deep reinforcement learning approach for intelligent routing in software-defined data-center networks},
+journal = {Journal of Network and Computer Applications},
+volume = {177},
+pages = {102865},
+year = {2021},
+issn = {1084-8045},
+doi = {https://doi.org/10.1016/j.jnca.2020.102865},
+url = {https://www.sciencedirect.com/science/article/pii/S1084804520303313},
+author = {Wai-xi Liu and Jun Cai and Qing Chun Chen and Yu Wang},
+abstract = {Data-center networks (DCN) possess multiple new features: coexistence of elephant flow/mice flow/coflow, and coexistence of multiple network resources (bandwidth, cache and computing). The cache should be a factor of effecting routing decision because it can eliminate redundant traffic in DCN. However, the conventional routing schemes cannot learn from their previous experiences regarding network abnormalities (such as, congestion), and their metric are still the single link state (such as, hop, distance, and cost) which does not include the effect of cache. Thus, they cannot enough efficiently allocate these resources to well meet the performance requirements for various flow types. Therefore, this paper proposes deep reinforcement learning-based routing (DRL-R). Firstly, we propose a method that recombines multiple network resources with different metrics, where we recombine cache and bandwidth by quantifying their contribution score in reducing the delay. Secondly, we propose a routing scheme with resource-recombined state. By optimally allocating network resources for traffic, a DRL agent deployed on a software-defined networking (SDN) controller continually interacts with the network to adaptively perform reasonable routing according to the network state. We employ deep Q-network (DQN) and deep deterministic policy gradient (DDPG) to build the DRL-R. Finally, we demonstrate the effectiveness of DRL-R through extensive simulations. Benefitting from continuous learning with a global view, DRL-R has lower flow completion time, higher throughput and better load balance as well as better robustness, compared to OSPF. In addition, because it efficiently utilizes the network resources, DRL-R can also outperform another DRL-based routing scheme (namely TIDE). Compared to OSPF and TIDE, respectively, DRL-R can improve throughput by up to 40% and 18.5%; DRL-R can reduce flow completion time by up to 47% and 39%; DRL-R can improve the link load balance by up to 18.8% and 9.3%. Additionally, we observed that DDPG has better performance than DQN.}
+}
+}
+
+@article{cdpfs,
+  title={Dynamic parallel flow algorithms with centralized scheduling for load balancing in cloud data center networks},
+  author={Li, Kai and Liu, Xuxun and Liu, Keping},
+  journal={IEEE Systems Journal},
+  volume={13},
+  number={3},
+  pages={2662--2673},
+  year={2018},
+  publisher={IEEE}
+}
+
+@article{scalable_rl,
+  title={Reinforcement Learning for Dynamic Traffic Routing and Optimization},
+  author={Ebadinezhad, Sahar and Conteh, Ahmed and Ali, Khaldoon Arshed and Hussein, Ibrahim Khalaf},
+  journal={Journal of Communications},
+  volume={18},
+  number={4},
+  year={2023}
+}
+
+@inproceedings{delay_aware,
+   author={Casas-Velasco, Daniela M. and Rendon, Oscar Mauricio Caicedo and da Fonseca, Nelson L. S.},
+  journal={IEEE Transactions on Network and Service Management}, 
+  title={DRSIR: A Deep Reinforcement Learning Approach for Routing in Software-Defined Networking}, 
+  year={2022},
+  volume={19},
+  number={4},
+  pages={4807-4820},
+  keywords={Routing;Artificial neural networks;Topology;Reinforcement learning;Network topology;Computer architecture;Computational modeling;Deep reinforcement learning;routing;software defined networking},
+  doi={10.1109/TNSM.2021.3132491}}
+}
+
+% --- THEORETICAL FOUNDATIONS ---
+
+@article{kdn,
+  title={Knowledge-defined networking},
+  author={Mestres, Albert and Rodriguez-Natal, Alberto and Carner, Josep and Barlet-Ros, Pere and Alarc{\'o}n, Eduard and Sol{\'e}, Marc and Cabellos-Aparicio, Albert and Bonaventure, Olivier and Rossi, Dario and Litas, L},
+  journal={ACM SIGCOMM Computer Communication Review},
+  volume={47},
+  number={3},
+  pages={2--10},
+  year={2017},
+  publisher={ACM New York, NY, USA}
+}
+
+@inproceedings{actor_critic,
+  title={Asynchronous methods for deep reinforcement learning},
+  author={Mnih, Volodymyr and Badia, Adria Puigdomenech and Mirza, Mehdi and Graves, Alex and Lillicrap, Timothy and Harley, Tim and Silver, David and Kavukcuoglu, Koray},
+  booktitle={International conference on machine learning},
+  pages={1928--1937},
+  year={2016},
+  organization={PMLR}
+}
+@inproceedings{10.5555/1855711.1855730,
+author = {Al-Fares, Mohammad and Radhakrishnan, Sivasankar and Raghavan, Barath and Huang, Nelson and Vahdat, Amin},
+title = {Hedera: dynamic flow scheduling for data center networks},
+year = {2010},
+publisher = {USENIX Association},
+address = {USA},
+abstract = {Today's data centers offer tremendous aggregate bandwidth to clusters of tens of thousands of machines. However, because of limited port densities in even the highest-end switches, data center topologies typically consist of multi-rooted trees with many equal-cost paths between any given pair of hosts. Existing IP multipathing protocols usually rely on per-flow static hashing and can cause substantial bandwidth losses due to long-term collisions.In this paper, we present Hedera, a scalable, dynamic flow scheduling system that adaptively schedules a multi-stage switching fabric to efficiently utilize aggregate network resources. We describe our implementation using commodity switches and unmodified hosts, and show that for a simulated 8,192 host data center, Hedera delivers bisection bandwidth that is 96\% of optimal and up to 113\% better than static load-balancing methods.},
+booktitle = {Proceedings of the 7th USENIX Conference on Networked Systems Design and Implementation},
+pages = {19},
+numpages = {1},
+location = {San Jose, California},
+series = {NSDI'10}
+}
+@INPROCEEDINGS{5934956,
+  author={Curtis, Andrew R. and Kim, Wonho and Yalagandula, Praveen},
+  booktitle={2011 Proceedings IEEE INFOCOM}, 
+  title={Mahout: Low-overhead datacenter traffic management using end-host-based elephant detection}, 
+  year={2011},
+  volume={},
+  number={},
+  pages={1629-1637},
+  keywords={Switches;Heating},
+  doi={10.1109/INFCOM.2011.5934956}}

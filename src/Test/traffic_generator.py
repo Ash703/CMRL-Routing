@@ -138,7 +138,7 @@ def generate_traffic(net, flow_interval_sec=2.0):
     
     # We need the config path to find leaves. 
     # Assuming standard location or passed via env. Defaulting to 'network_config.yaml'
-    config_path = os.environ.get("NETWORK_CONFIG_FILE", "network_config.yaml")
+    config_path = os.environ.get("NETWORK_CONFIG_FILE", "src/network_config3.yaml")
     
     ensure_log_directory_exists()
     stop_all_iperf_servers(net)

@@ -25,7 +25,7 @@ ROUTING_ALGO = "RL"  # "RL", "ECMP", "STATIC", "GREEDY", "RANDOM", "RR"
 POLL_INTERVAL = 2.0
 TRAFFIC_LOG_DIR = "./traffic_logs"
 HANDSHAKE_FILE = "active_flow_config.json"
-CHECKPOINT_DIR = "checkpoints2"
+CHECKPOINT_DIR = "checkpoints4"
 MODEL_SAVE_STEPS = 20
 DEVICE = 'cpu'
 

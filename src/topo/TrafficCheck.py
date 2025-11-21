@@ -5,6 +5,7 @@ import os
 import json
 import csv
 import numpy as np
+import yaml
 from mininet.log import info, error
 
 # ==============================================================================
@@ -13,71 +14,68 @@ from mininet.log import info, error
 EXPERIMENT_DURATION = 120  # Seconds (2 minutes)
 POLL_INTERVAL = 1.0        # How often to read stats
 RANDOM_SEED = 42           # For reproducibility
-OUTPUT_DIR = "/home/Ash/Documents/ACN/CMRL-Routing/results_metrics"
+OUTPUT_DIR = "results_metrics"
+HANDSHAKE_FILE = "active_flow_config.json"
+TRAFFIC_LOG_DIR = "./traffic_logs"
+
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(TRAFFIC_LOG_DIR, exist_ok=True)
 
 # Global Flags
 STOP_FLAG = threading.Event()
-FLOW_METRICS = {}  # Stores start/end times for FCT
-LINK_STATS = {}    # Stores bytes for Skew/Fairness
+FLOW_METRICS = {}  
+LINK_STATS = {}    
 
 # ==============================================================================
-# FLOW GENERATION LOGIC
+# HELPER: Flow Parameters (Your Specific Logic)
 # ==============================================================================
-
-def get_random_flow_params(flow_type):
-    """
-    Returns randomized parameters (duration, bandwidth, streams) based on type constraints.
-    """
+def get_random_flow_params(flow_type, remaining_time):
     params = {}
     
+    # 1. Define constraints
     if flow_type == 'elephant':
-        # Duration: 20s to 140s
-        params['t'] = random.randint(20, 140)
-        # Bandwidth: 5Mbps to 5Gbps (Randomly pick a value in Mbps)
-        # Note: 5Gbps is huge for Mininet/OVS, usually capped by link speed (1G), 
-        # but we set the param as requested.
-        bw_mbps = random.randint(5, 1000)
+        raw_t = random.randint(20, 140)
+        bw_mbps = random.randint(5, 5000) 
         params['b'] = f"{bw_mbps}M"
-        # Parallel Streams: 4 to 10
         params['P'] = random.randint(4, 10)
-        
     elif flow_type == 'video':
-        # Duration: 10s to 30s
-        params['t'] = random.randint(10, 30)
-        # Bandwidth: 10Mbps to 100Mbps
+        raw_t = random.randint(10, 30)
         bw_mbps = random.randint(10, 100)
         params['b'] = f"{bw_mbps}M"
-        # Parallel Streams: 2 to 4
         params['P'] = random.randint(2, 4)
-        
     elif flow_type == 'interactive':
-        # Duration: 5s to 10s
-        params['t'] = random.randint(5, 10)
-        # Bandwidth: 100Kbps (Fixed or small range)
+        raw_t = random.randint(5, 10)
         params['b'] = "100K"
         params['P'] = 1
-        
-    else: # 'mice' (Default)
-        # Duration: 0.1s to 1s
-        params['t'] = random.uniform(0.1, 1.0)
-        # Bandwidth: 200Kbps
+    else: # mice
+        raw_t = random.uniform(0.1, 1.0)
         params['b'] = "200K"
         params['P'] = 1
+
+    # 2. Safety Clamp (Don't run past experiment end)
+    allowed_t = remaining_time - 2.0
+    if allowed_t < 0.2: return None
+        
+    params['t'] = min(raw_t, allowed_t)
+    
+    # Format for iperf
+    if isinstance(params['t'], float):
+        params['t_str'] = f"{params['t']:.2f}"
+    else:
+        params['t_str'] = str(int(params['t']))
         
     return params
 
 # ==============================================================================
-# METRIC CALCULATIONS
+# METRICS
 # ==============================================================================
-
 def calculate_jains_fairness(values):
-    if not values or len(values) == 0: return 0.0
-    active_values = [v for v in values if v > 0]
-    if not active_values: return 0.0
-    n = len(active_values)
-    sum_x = sum(active_values)
-    sum_sq = sum(v**2 for v in active_values)
+    if not values: return 0.0
+    active = [v for v in values if v > 0]
+    if not active: return 0.0
+    n = len(active)
+    sum_x = sum(active)
+    sum_sq = sum(v**2 for v in active)
     if sum_sq == 0: return 0.0
     return (sum_x ** 2) / (n * sum_sq)
 
@@ -87,25 +85,15 @@ def calculate_link_skew(link_bytes_map):
     return np.std(values)
 
 # ==============================================================================
-# TRAFFIC GENERATION
+# TRAFFIC GENERATION THREAD
 # ==============================================================================
-
-def run_iperf_flow(src, dst_ip, duration, bandwidth, streams, flow_type, flow_id):
-    """
-    Runs a single flow and records Flow Completion Time (FCT).
-    """
+def run_iperf_flow(src, dst_ip, duration_str, bandwidth, streams, flow_type, flow_id):
     FLOW_METRICS[flow_id] = {
-        'start': time.time(), 
-        'status': 'running', 
-        'bytes': 0, 
-        'type': flow_type
+        'start': time.time(), 'status': 'running', 'bytes': 0, 'type': flow_type
     }
     
-    # -P: Parallel streams, -t: duration, -b: bandwidth, -J: JSON output
-    # We assume duration is int, if float (mice), format it
-    dur_str = f"{duration:.2f}" if isinstance(duration, float) else str(duration)
-    
-    cmd = f"iperf3 -c {dst_ip} -t {dur_str} -b {bandwidth} -P {streams} -J"
+    # JSON output for parsing
+    cmd = f"iperf3 -c {dst_ip} -t {duration_str} -b {bandwidth} -P {streams} -J"
     
     try:
         result_json = src.cmd(cmd)
@@ -113,170 +101,244 @@ def run_iperf_flow(src, dst_ip, duration, bandwidth, streams, flow_type, flow_id
         
         try:
             data = json.loads(result_json)
-            # Sum sent bytes across all streams
+            if 'error' in data:
+                FLOW_METRICS[flow_id]['status'] = 'error'
+                return
+
             sent_bytes = data['end']['sum_sent']['bytes']
-            sender_throughput = data['end']['sum_sent']['bits_per_second'] / 1e6 # Mbps
+            sender_thru = data['end']['sum_sent']['bits_per_second'] / 1e6
             
             FLOW_METRICS[flow_id]['status'] = 'completed'
             FLOW_METRICS[flow_id]['bytes'] = sent_bytes
-            FLOW_METRICS[flow_id]['throughput'] = sender_throughput
-        except:
-            FLOW_METRICS[flow_id]['status'] = 'failed'
+            FLOW_METRICS[flow_id]['throughput'] = sender_thru
             
-    except Exception as e:
-        FLOW_METRICS[flow_id]['status'] = 'error'
+        except json.JSONDecodeError:
+            FLOW_METRICS[flow_id]['status'] = 'failed_parse'
+            
+    except Exception:
+        FLOW_METRICS[flow_id]['status'] = 'exec_error'
 
-def traffic_generator_loop(net, seed):
-    """
-    Generates randomized traffic between random nodes using specified Flow Types.
-    """
+def traffic_generator_loop(net, seed, start_time):
     random.seed(seed)
     hosts = net.hosts
-    flow_counter = 0
+    counter = 0
     
-    # Flow Type Probabilities (Adjust as needed)
-    # Mice are frequent, Elephants are rare
     types = ['mice', 'interactive', 'video', 'elephant']
     weights = [0.4, 0.3, 0.2, 0.1] 
     
-    info(f"*** Starting Traffic Gen (Seed: {seed}, Duration: {EXPERIMENT_DURATION}s)...\n")
-    
-    start_time = time.time()
+    info(f"*** Starting Dynamic Traffic Loop...\n")
     
     while not STOP_FLAG.is_set():
-        if time.time() - start_time > (EXPERIMENT_DURATION - 5):
-            break
+        elapsed = time.time() - start_time
+        remaining = EXPERIMENT_DURATION - elapsed
+        
+        if remaining < 5: break
             
-        # 1. Pick Random Pair
+        # Random Pair
         src = random.choice(hosts)
         dst = random.choice(hosts)
         if src == dst: continue
         
-        # 2. Pick Flow Type & Parameters
+        # Random Type
         f_type = random.choices(types, weights=weights, k=1)[0]
-        params = get_random_flow_params(f_type)
+        params = get_random_flow_params(f_type, remaining)
         
-        # 3. Launch Flow
-        flow_id = f"{f_type}_{flow_counter}"
+        if not params: continue
+            
+        fid = f"{f_type}_{counter}"
         t = threading.Thread(
             target=run_iperf_flow, 
-            args=(src, dst.IP(), params['t'], params['b'], params['P'], f_type, flow_id)
+            args=(src, dst.IP(), params['t_str'], params['b'], params['P'], f_type, fid)
         )
         t.daemon = True
         t.start()
         
-        flow_counter += 1
+        counter += 1
         
-        # Inter-arrival time: Poisson-like
-        # Heavy flows shouldn't start too frequently to avoid instant saturation
+        # Rate limiting to avoid crashing Mininet
         if f_type == 'elephant':
-            time.sleep(random.uniform(2.0, 5.0))
+            time.sleep(random.uniform(2.0, 4.0))
         else:
-            time.sleep(random.uniform(0.1, 1.0))
+            time.sleep(random.uniform(0.2, 0.8))
 
 # ==============================================================================
-# STATISTICS MONITOR
+# HANDSHAKE & SETUP
 # ==============================================================================
+def setup_rl_handshake(net):
+    """Starts Primary Flow and writes config for Controller."""
+    config_path = os.environ.get("NETWORK_CONFIG_FILE", "network_config.yaml")
+    if not os.path.exists(config_path): 
+        info("Config file not found for handshake, skipping.\n")
+        return
 
+    try:
+        with open(config_path, 'r') as f: raw = yaml.safe_load(f)
+        leaf_map = {}
+        for h in raw['hosts']:
+            l = h['connected_to']
+            if l not in leaf_map: leaf_map[l] = []
+            leaf_map[l].append(h['name'])
+        
+        leaves = list(leaf_map.keys())
+        if len(leaves) < 2: return
+        
+        # Pick hosts on different leaves
+        src_h = net.get(leaf_map[leaves[0]][0])
+        dst_h = net.get(leaf_map[leaves[1]][0])
+        
+        # Start Primary Flow (Long Duration)
+        log_path = os.path.abspath(os.path.join(TRAFFIC_LOG_DIR, "rl_target_flow.json"))
+        dur = EXPERIMENT_DURATION + 10
+        # Note: -P 4 for parallel
+        cmd = f"iperf3 -c {dst_h.IP()} -t {dur} -b 50M -P 4 -J > {log_path} &"
+        src_h.cmd(cmd)
+        
+        # Write Config
+        cfg = {"src_ip": src_h.IP(), "dst_ip": dst_h.IP(), "log_path": log_path}
+        with open(os.path.join(TRAFFIC_LOG_DIR, HANDSHAKE_FILE), 'w') as f:
+            json.dump(cfg, f)
+            
+        info(f"*** RL Target: {src_h.name} -> {dst_h.name}\n")
+        
+    except Exception as e:
+        error(f"Handshake failed: {e}\n")
+
+# ==============================================================================
+# STATS MONITOR (THE FIX FOR 0 THROUGHPUT)
+# ==============================================================================
 def monitor_links(net):
-    switches = [n for n in net.switches if n.name.startswith('s')]
-    snapshot_file = os.path.join(OUTPUT_DIR, "time_series_stats.csv")
+    # We assume spines start with 's1' (like s11, s12, s13)
+    spines = [n for n in net.switches if n.name.startswith('s1')]
+    csv_path = os.path.join(OUTPUT_DIR, "time_series_stats.csv")
     
-    with open(snapshot_file, 'w') as f:
-        writer = csv.writer(f)
-        writer.writerow(["Time", "AvgThroughput_Mbps", "LinkSkew", "JainFairness"])
+    with open(csv_path, 'w') as f:
+        csv.writer(f).writerow(["Time", "NetworkThroughput_Mbps", "LinkSkew", "JainFairness"])
     
     start_t = time.time()
+    prev_bytes = 0
+    prev_time = start_t
     
     while not STOP_FLAG.is_set():
-        current_link_usage = []
-        for sw in switches:
+        current_bytes = 0
+        usage_list = []
+        
+        # 1. Read Stats from Linux Kernel (Fast)
+        for sw in spines:
             for intf in sw.intfList():
                 if intf.name == "lo": continue
                 try:
-                    with open(f"/sys/class/net/{intf.name}/statistics/tx_bytes", "r") as f:
-                        current_link_usage.append(int(f.read().strip()))
+                    path = f"/sys/class/net/{intf.name}/statistics/tx_bytes"
+                    if os.path.exists(path):
+                        with open(path, "r") as f:
+                            b = int(f.read().strip())
+                            current_bytes += b
+                            usage_list.append(b)
                 except: pass
         
-        skew = calculate_link_skew({i: val for i, val in enumerate(current_link_usage)})
-        fairness = calculate_jains_fairness(current_link_usage)
+        # 2. Calculate Throughput (Delta)
+        now = time.time()
+        delta_t = now - prev_time
+        throughput = 0.0
         
-        completed = [f['throughput'] for f in FLOW_METRICS.values() if f.get('throughput')]
-        avg_thru = sum(completed)/len(completed) if completed else 0
+        if delta_t > 0 and prev_bytes > 0:
+            delta_bytes = current_bytes - prev_bytes
+            throughput = (delta_bytes * 8) / (delta_t * 1e6) # Mbps
+            
+        prev_bytes = current_bytes
+        prev_time = now
         
-        with open(snapshot_file, 'a') as f:
-            csv.writer(f).writerow([round(time.time()-start_t, 2), round(avg_thru, 2), round(skew, 4), round(fairness, 4)])
+        # 3. Calculate Load Balancing Metrics
+        skew = calculate_link_skew({i: v for i, v in enumerate(usage_list)})
+        fairness = calculate_jains_fairness(usage_list)
+        
+        # 4. Log
+        with open(csv_path, 'a') as f:
+            csv.writer(f).writerow([
+                round(now - start_t, 2), 
+                round(throughput, 2), 
+                round(skew, 4), 
+                round(fairness, 4)
+            ])
             
         time.sleep(POLL_INTERVAL)
 
 # ==============================================================================
-# MAIN EXECUTION
+# MAIN RUNNER
 # ==============================================================================
-
 def run_experiment(net, seed=RANDOM_SEED):
+    os.system(f"rm -f {TRAFFIC_LOG_DIR}/*.json")
+    
+    # 1. Start Servers on ALL hosts (Crucial for avoiding Connection Refused)
     info("*** Starting iperf3 servers...\n")
-    for h in net.hosts: h.cmd("iperf3 -s -p 5001 &")
-        
+    for h in net.hosts:
+        h.cmd("iperf3 -s -p 5001 &")
+    
+    # 2. Start Primary Flow (RL Target)
+    setup_rl_handshake(net)
+    
+    # 3. Start Monitoring
     monitor_t = threading.Thread(target=monitor_links, args=(net,))
     monitor_t.daemon = True
     monitor_t.start()
     
-    gen_t = threading.Thread(target=traffic_generator_loop, args=(net, seed))
+    # 4. Start Random Traffic
+    start_t = time.time()
+    gen_t = threading.Thread(target=traffic_generator_loop, args=(net, seed, start_t))
     gen_t.daemon = True
     gen_t.start()
     
-    info(f"*** Experiment Running for {EXPERIMENT_DURATION} seconds...\n")
+    # 5. Wait Loop
+    info(f"*** Running Experiment for {EXPERIMENT_DURATION}s...\n")
     for i in range(EXPERIMENT_DURATION):
         time.sleep(1)
-        if i % 10 == 0: info(f"Time: {i}/{EXPERIMENT_DURATION}s\n")
+        if i % 10 == 0 and i > 0:
+            info(f"... {i}s\n")
             
+    # 6. Cleanup
     STOP_FLAG.set()
     info("*** Stopping...\n")
-    time.sleep(5) 
+    time.sleep(5) # Grace period
     for h in net.hosts: h.cmd("killall -9 iperf3")
         
     compute_final_report()
 
 def compute_final_report():
-    info("\n*** Computing Final Metrics ***\n")
-    
-    # Group metrics by Flow Type
+    info("\n*** Final Summary ***\n")
     type_stats = {}
     
-    for fid, data in FLOW_METRICS.items():
-        if data['status'] == 'completed':
-            ftype = data['type']
-            if ftype not in type_stats:
-                type_stats[ftype] = {'fct': [], 'thru': []}
+    # Group by Flow Type
+    for fid, d in FLOW_METRICS.items():
+        if d.get('status') == 'completed':
+            t = d['type']
+            if t not in type_stats: type_stats[t] = {'fct': [], 'thru': []}
             
-            duration = data['end'] - data['start']
-            type_stats[ftype]['fct'].append(duration)
-            type_stats[ftype]['thru'].append(data['throughput'])
-    
-    summary_file = "final_comparison_results.csv"
-    file_exists = os.path.isfile(summary_file)
-    # algo = os.environ.get("ROUTING_ALGO", "Unknown")
-    algo="RL"
+            dur = d['end'] - d['start']
+            type_stats[t]['fct'].append(dur)
+            type_stats[t]['thru'].append(d['throughput'])
+            
+    csv_file = "final_comparison_results.csv"
+    file_exists = os.path.isfile(csv_file)
+    algo = os.environ.get("ROUTING_ALGO", "Unknown")
     
     rows = []
-    for ftype, stats in type_stats.items():
+    for t, s in type_stats.items():
         rows.append({
             "Algorithm": algo,
-            "FlowType": ftype,
-            "Count": len(stats['fct']),
-            "Avg_FCT": sum(stats['fct'])/len(stats['fct']),
-            "Avg_Throughput": sum(stats['thru'])/len(stats['thru'])
+            "FlowType": t,
+            "Count": len(s['fct']),
+            "Avg_FCT": sum(s['fct'])/len(s['fct']),
+            "Avg_Throughput": sum(s['thru'])/len(s['thru'])
         })
         
-    print(json.dumps(rows, indent=4))
+    print(json.dumps(rows, indent=2))
     
-    with open(summary_file, 'a') as f:
-        fieldnames = ["Algorithm", "FlowType", "Count", "Avg_FCT", "Avg_Throughput"]
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+    with open(csv_file, 'a') as f:
+        headers = ["Algorithm", "FlowType", "Count", "Avg_FCT", "Avg_Throughput"]
+        writer = csv.DictWriter(f, fieldnames=headers)
         if not file_exists: writer.writeheader()
         for r in rows: writer.writerow(r)
         
-    info(f"*** Results saved to {summary_file} ***\n")
+    info(f"*** Saved to {csv_file} ***\n")
 
 def start_analysis(net):
     run_experiment(net)

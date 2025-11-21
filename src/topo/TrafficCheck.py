@@ -13,7 +13,7 @@ from mininet.log import info, error
 EXPERIMENT_DURATION = 120  # Seconds (2 minutes)
 POLL_INTERVAL = 1.0        # How often to read stats
 RANDOM_SEED = 42           # For reproducibility
-OUTPUT_DIR = "results_metrics"
+OUTPUT_DIR = "/home/Ash/Documents/ACN/CMRL-Routing/results_metrics"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # Global Flags
@@ -37,7 +37,7 @@ def get_random_flow_params(flow_type):
         # Bandwidth: 5Mbps to 5Gbps (Randomly pick a value in Mbps)
         # Note: 5Gbps is huge for Mininet/OVS, usually capped by link speed (1G), 
         # but we set the param as requested.
-        bw_mbps = random.randint(5, 5000)
+        bw_mbps = random.randint(5, 1000)
         params['b'] = f"{bw_mbps}M"
         # Parallel Streams: 4 to 10
         params['P'] = random.randint(4, 10)

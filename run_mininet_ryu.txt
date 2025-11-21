@@ -11,4 +11,4 @@ py exec("import sys; sys.path.append('/home/Ash/Documents/ACN/CMRL-Routing/src/t
 
 sudo tc qdisc change dev s11-eth2 root netem delay 1ms loss 1%
 
-py exec("import sys; sys.path.append('/home/Ash/Documents/ACN/CMRL-Routing/src/topo'); from TrafficSimulator import generate_traffic; generate_traffic(net)")
+py exec("import sys; sys.path.append('/home/Ash/Documents/ACN/CMRL-Routing/src/topo'); from TrafficCheck import start_analysis; start_analysis(net)")

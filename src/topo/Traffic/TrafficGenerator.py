@@ -9,7 +9,7 @@ import yaml
 EXPERIMENT_DURATION = 120  # Seconds
 RANDOM_SEED = 42           # Change this to vary the "Scenario"
 OUTPUT_FILE = "traffic_schedule.json"
-NETWORK_CONFIG = os.environ.get("NETWORK_CONFIG_FILE", "network_config.yaml")
+NETWORK_CONFIG = "src/network_config3.yaml"
 
 # Flow Probabilities
 FLOW_TYPES_PROBS = {

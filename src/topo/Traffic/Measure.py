@@ -9,9 +9,10 @@ from mininet.log import info, error
 # ==============================================================================
 # CONFIGURATION
 # ==============================================================================
-SCHEDULE_FILE = "traffic_schedule.json"
-OUTPUT_DIR = "results_metrics"
+SCHEDULE_FILE = "/home/Ash/Documents/ACN/CMRL-Routing/traffic_schedule.json"
+OUTPUT_DIR = "/home/Ash/Documents/ACN/CMRL-Routing/results_metrics"
 HANDSHAKE_FILE = "active_flow_config.json"
+TRAFFIC_LOG_DIR = "/home/Ash/Documents/ACN/CMRL-Routing"
 POLL_INTERVAL = 1.0
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)

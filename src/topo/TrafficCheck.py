@@ -2,370 +2,238 @@ import time
 import random
 import threading
 import os
-import json
-import csv
-import numpy as np
-import yaml
+import math
 from mininet.log import info, error
 
-# ==============================================================================
-# CONFIGURATION
-# ==============================================================================
-EXPERIMENT_DURATION = 120  # Seconds (2 minutes)
-POLL_INTERVAL = 1.0        # How often to read stats
-RANDOM_SEED = 42           # For reproducibility
-OUTPUT_DIR = "results_metrics"
-HANDSHAKE_FILE = "active_flow_config.json"
-TRAFFIC_LOG_DIR = "./traffic_logs"
+# Configuration
+TRAFFIC_LOG_DIR = "/home/Ash/Documents/ACN/CMRL-Routing"  # The directory to store iperf3 log files
 
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-os.makedirs(TRAFFIC_LOG_DIR, exist_ok=True)
-
-# Global Flags
+# Global control flag to stop all traffic threads gracefully
 STOP_FLAG = threading.Event()
-FLOW_METRICS = {}  
-LINK_STATS = {}    
+FLOW_THREADS = []
+MASTER_RUN_SECONDS = 120  # 2 minutes
 
-# ==============================================================================
-# HELPER: Flow Parameters
-# ==============================================================================
-def get_random_flow_params(flow_type, remaining_time):
-    params = {}
-    
-    # 1. Define constraints per your specs
-    if flow_type == 'elephant':
-        raw_t = random.randint(20, 140)
-        bw_mbps = random.randint(5, 5000) 
-        params['b'] = f"{bw_mbps}M"
-        params['P'] = random.randint(4, 10)
-    elif flow_type == 'video':
-        raw_t = random.randint(10, 30)
-        bw_mbps = random.randint(10, 100)
-        params['b'] = f"{bw_mbps}M"
-        params['P'] = random.randint(2, 4)
-    elif flow_type == 'interactive':
-        raw_t = random.randint(5, 10)
-        params['b'] = "100K"
-        params['P'] = 1
-    else: # mice
-        raw_t = random.uniform(0.1, 1.0)
-        params['b'] = "200K"
-        params['P'] = 1
+def ensure_log_directory_exists():
+    os.makedirs(TRAFFIC_LOG_DIR, exist_ok=True)
+    info(f"*** Ensured log directory exists: {TRAFFIC_LOG_DIR}\n")
 
-    # 2. Safety Clamp (CRITICAL FIX)
-    # We reserve 5 seconds buffer. If the flow attempts to run past the 
-    # shutdown time, we cut it short so it finishes successfully.
-    # If the remaining window is too small, we skip generating the flow.
-    allowed_t = remaining_time - 5.0
-    
-    if allowed_t < 1.0: 
-        return None
-        
-    # Clamp duration to fit in the experiment window
-    params['t'] = min(raw_t, allowed_t)
-    
-    # Format for iperf command
-    if isinstance(params['t'], float):
-        params['t_str'] = f"{params['t']:.2f}"
-    else:
-        params['t_str'] = str(int(params['t']))
-        
-    return params
+# -------------------- iperf3 Utility --------------------
 
-# ==============================================================================
-# METRICS
-# ==============================================================================
-def calculate_jains_fairness(values):
-    if not values: return 0.0
-    active = [v for v in values if v > 0]
-    if not active: return 0.0
-    n = len(active)
-    sum_x = sum(active)
-    sum_sq = sum(v**2 for v in active)
-    if sum_sq == 0: return 0.0
-    return (sum_x ** 2) / (n * sum_sq)
+def start_iperf_server(host, port=5001):
+    ensure_log_directory_exists()
+    log_file = os.path.join(TRAFFIC_LOG_DIR, f"iperf3-server-log-{host.name}.txt")
+    info(f"*** Starting iperf3 server on {host.name}, logging to {log_file}\n")
+    host.cmd(f"iperf3 -s -p {port} > {log_file} 2>&1 &")
 
-def calculate_link_skew(link_bytes_map):
-    if not link_bytes_map: return 0.0
-    values = list(link_bytes_map.values())
-    return np.std(values)
+def stop_all_iperf_servers(net):
+    info("*** Stopping all iperf3 processes...\n")
+    for host in net.hosts:
+        host.cmd("killall -9 iperf3 > /dev/null 2>&1")
 
-# ==============================================================================
-# TRAFFIC GENERATION THREAD
-# ==============================================================================
-def run_iperf_flow(src, dst_ip, duration_str, bandwidth, streams, flow_type, flow_id):
-    FLOW_METRICS[flow_id] = {
-        'start': time.time(), 'status': 'running', 'bytes': 0, 'type': flow_type
+# -------------------- Flow Type Ranges --------------------
+
+FLOW_TYPES = {
+    'mice': {'t': 0.2, 'b': 200, 'P': 1},
+    'elephant': {'t': 30, 'b': 5000, 'P': 4},
+    'video': {'t': 15, 'b': 2000, 'P': 2},
+    'interactive': {'t': 5, 'b': 100, 'P': 1}
+}
+
+# UPDATED: mice & interactive now in Kbps
+FLOW_RANGES = {
+    'mice': {
+        't': (0.1, 1.0),
+        'b': (0.05, 1.0),        # 50 Kbps – 1 Mbps
+        'P': (1, 2)
+    },
+    'elephant': {
+        't': (20, 40),
+        'b': (100, 1000),        # Mbps
+        'P': (2, 8)
+    },
+    'video': {
+        't': (10, 30),
+        'b': (2, 80),            # Mbps
+        'P': (1, 4)
+    },
+    'interactive': {
+        't': (5, 10),
+        'b': (0.05, 0.2),        # 50–200 Kbps
+        'P': (1, 1)
     }
-    
-    # -J ensures JSON output. We rely on this for final stats.
-    cmd = f"iperf3 -c {dst_ip} -t {duration_str} -b {bandwidth} -P {streams} -J"
-    
-    try:
-        result_json = src.cmd(cmd)
-        FLOW_METRICS[flow_id]['end'] = time.time()
-        
-        try:
-            data = json.loads(result_json)
-            # Check for iperf-specific errors (like 'server busy')
-            if 'error' in data:
-                # info(f"Flow {flow_id} Error: {data['error']}\n")
-                FLOW_METRICS[flow_id]['status'] = 'error'
-                return
+}
 
-            sent_bytes = data['end']['sum_sent']['bytes']
-            sender_thru = data['end']['sum_sent']['bits_per_second'] / 1e6
-            
-            FLOW_METRICS[flow_id]['status'] = 'completed'
-            FLOW_METRICS[flow_id]['bytes'] = sent_bytes
-            FLOW_METRICS[flow_id]['throughput'] = sender_thru
-            
-        except json.JSONDecodeError:
-            # If the flow was killed or connection failed, JSON is invalid
-            FLOW_METRICS[flow_id]['status'] = 'failed_parse'
-            
-    except Exception:
-        FLOW_METRICS[flow_id]['status'] = 'exec_error'
+FLOW_TYPE_WEIGHTS = {
+    'mice': 0.6,
+    'interactive': 0.15,
+    'video': 0.15,
+    'elephant': 0.1
+}
 
-def traffic_generator_loop(net, seed, start_time):
-    random.seed(seed)
-    hosts = net.hosts
-    counter = 0
-    
-    # Adjusted Weights: Boost Elephant to 25% to ensure they appear
-    types = ['mice', 'interactive', 'video', 'elephant']
-    weights = [0.35, 0.2, 0.2, 0.25] 
-    
-    info(f"*** Starting Dynamic Traffic Loop...\n")
-    
-    while not STOP_FLAG.is_set():
-        elapsed = time.time() - start_time
-        remaining = EXPERIMENT_DURATION - elapsed
-        
-        # Stop generating new flows 15s before end to allow running flows to finish
-        if remaining < 15: 
-            break
-            
-        # Random Pair
-        src = random.choice(hosts)
-        dst = random.choice(hosts)
-        if src == dst: continue
-        
-        # Random Type
-        f_type = random.choices(types, weights=weights, k=1)[0]
-        params = get_random_flow_params(f_type, remaining)
-        
-        # If we don't have enough time for this type, try again next loop
-        if not params: 
-            time.sleep(0.5)
-            continue
-            
-        fid = f"{f_type}_{counter}"
-        t = threading.Thread(
-            target=run_iperf_flow, 
-            args=(src, dst.IP(), params['t_str'], params['b'], params['P'], f_type, fid)
+def choose_flow_type():
+    types = list(FLOW_TYPE_WEIGHTS.keys())
+    w = [FLOW_TYPE_WEIGHTS[t] for t in types]
+    return random.choices(types, weights=w, k=1)[0]
+
+def format_bandwidth_mbps(mbps_float):
+    if mbps_float >= 1:
+        if mbps_float >= 1000:
+            g = mbps_float / 1000.0
+            return f"{g:.3f}G" if not math.isclose(g, round(g)) else f"{int(round(g))}G"
+        return f"{mbps_float:.1f}M"
+    else:
+        # <1 Mbps → show as Kbps
+        kbps = mbps_float * 1000
+        return f"{int(kbps)}K"
+
+# -------------------- Run One Flow --------------------
+
+def run_traffic_flow(src_host, dst_ip, duration_sec, bandwidth_mbps,
+                     parallel_streams=1, port=5001, json_logfile=None):
+
+    duration_sec = min(duration_sec, MASTER_RUN_SECONDS)
+    bw_arg = format_bandwidth_mbps(float(bandwidth_mbps))
+    pstreams = max(1, int(parallel_streams))
+
+    if json_logfile:
+        cmd = (
+            f"iperf3 -c {dst_ip} -p {port} -t {int(duration_sec)} "
+            f"-b {bw_arg} -P {pstreams} --json > {json_logfile} 2>&1"
         )
-        t.daemon = True
-        t.start()
-        
-        if counter % 10 == 0:
-            info(f"Launched {f_type} flow (ID: {counter})\n")
+    else:
+        cmd = (
+            f"iperf3 -c {dst_ip} -p {port} -t {int(duration_sec)} "
+            f"-b {bw_arg} -P {pstreams} > /dev/null 2>&1"
+        )
 
-        counter += 1
-        
-        # Adjusted Sleep: Reduced penalty for Elephants
-        if f_type == 'elephant':
-            time.sleep(random.uniform(1.0, 3.0))
-        else:
-            time.sleep(random.uniform(0.2, 0.8))
+    info(f"[FLOW START] {src_host.name}->{dst_ip} {duration_sec}s bw={bw_arg} P={pstreams}\n")
+    src_host.cmd(cmd)
+    info(f"[FLOW END] {src_host.name}->{dst_ip}\n")
 
-# ==============================================================================
-# HANDSHAKE & SETUP
-# ==============================================================================
-def setup_rl_handshake(net):
-    """Starts Primary Flow and writes config for Controller."""
-    config_path = os.environ.get("NETWORK_CONFIG_FILE", "network_config.yaml")
-    if not os.path.exists(config_path): 
-        info("Config file not found for handshake, skipping.\n")
+# -------------------- Random Param Sampler --------------------
+
+def sample_flow_params(ftype):
+    r = FLOW_RANGES[ftype]
+    duration = random.uniform(*r['t'])
+    bandwidth = random.uniform(*r['b'])
+    pstreams = random.randint(int(r['P'][0]), int(r['P'][1]))
+    return duration, bandwidth, pstreams
+
+# -------------------- Primary RL Flow --------------------
+
+def start_h1_h4_parallel_flow(net, port=5001):
+    try:
+        ensure_log_directory_exists()
+        h1 = net.get('h1')
+        h4 = net.get('h4')
+    except Exception:
+        error("*** h1/h4 not found\n")
         return
 
-    try:
-        with open(config_path, 'r') as f: raw = yaml.safe_load(f)
-        leaf_map = {}
-        for h in raw['hosts']:
-            l = h['connected_to']
-            if l not in leaf_map: leaf_map[l] = []
-            leaf_map[l].append(h['name'])
-        
-        leaves = list(leaf_map.keys())
-        if len(leaves) < 2: return
-        
-        src_h = net.get(leaf_map[leaves[0]][0])
-        dst_h = net.get(leaf_map[leaves[1]][0])
-        
-        # FIX: Set duration shorter than experiment so it finishes cleanly
-        log_path = os.path.abspath(os.path.join(TRAFFIC_LOG_DIR, "rl_target_flow.json"))
-        dur = max(10, EXPERIMENT_DURATION - 5) 
-        
-        # Primary flow needs to be robust
-        cmd = f"iperf3 -c {dst_h.IP()} -t {dur} -b 50M -P 4 -J > {log_path} &"
-        src_h.cmd(cmd)
-        
-        cfg = {"src_ip": src_h.IP(), "dst_ip": dst_h.IP(), "log_path": log_path}
-        with open(os.path.join(TRAFFIC_LOG_DIR, HANDSHAKE_FILE), 'w') as f:
-            json.dump(cfg, f)
-            
-        info(f"*** RL Target Started ({dur}s): {src_h.name} -> {dst_h.name}\n")
-        
-    except Exception as e:
-        error(f"Handshake failed: {e}\n")
+    duration, bandwidth, pstreams = sample_flow_params('elephant')
+    duration = min(duration, MASTER_RUN_SECONDS)
+    log_file = os.path.join(TRAFFIC_LOG_DIR, "h1_h4_parallel_flow.json")
 
-# ==============================================================================
-# STATS MONITOR (Fixed Throughput Calculation)
-# ==============================================================================
-def monitor_links(net):
-    spines = [n for n in net.switches if n.name.startswith('s1')]
-    csv_path = os.path.join(OUTPUT_DIR, "time_series_stats.csv")
-    
-    with open(csv_path, 'w') as f:
-        csv.writer(f).writerow(["Time", "NetworkThroughput_Mbps", "LinkSkew", "JainFairness"])
-    
-    start_t = time.time()
-    prev_bytes = 0
-    prev_time = start_t
-    
+    def runner():
+        run_traffic_flow(h1, h4.IP(), duration, bandwidth, pstreams,
+                         port=port, json_logfile=log_file)
+
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+    FLOW_THREADS.append(t)
+
+    info(f"*** PRIMARY FLOW h1->h4 duration={duration:.1f} bw={format_bandwidth_mbps(bandwidth)} P={pstreams}\n")
+
+# -------------------- Background Traffic Loop --------------------
+
+def traffic_generation_loop(net, flow_interval_sec=1.5):
+    start_time = time.time()
+    hosts = net.hosts
+
+    info("*** Starting background traffic...\n")
+
     while not STOP_FLAG.is_set():
-        iter_start = time.time()
-        current_bytes = 0
-        usage_list = []
-        
-        # 1. Read Stats from Linux Kernel
-        for sw in spines:
-            for intf in sw.intfList():
-                if intf.name == "lo": continue
-                try:
-                    path = f"/sys/class/net/{intf.name}/statistics/tx_bytes"
-                    if os.path.exists(path):
-                        with open(path, "r") as f:
-                            b = int(f.read().strip())
-                            current_bytes += b
-                            usage_list.append(b)
-                except: pass
-        
-        # 2. Calculate Throughput Delta
-        delta_t = iter_start - prev_time
-        throughput = 0.0
-        
-        if delta_t > 0 and prev_bytes > 0:
-            delta_bytes = current_bytes - prev_bytes
-            # Bytes * 8 bits / (time * 1,000,000) = Mbps
-            throughput = (delta_bytes * 8) / (delta_t * 1e6)
-            
-        prev_bytes = current_bytes
-        prev_time = iter_start
-        
-        # 3. Metrics
-        skew = calculate_link_skew({i: v for i, v in enumerate(usage_list)})
-        fairness = calculate_jains_fairness(usage_list)
-        
-        # 4. Log
-        with open(csv_path, 'a') as f:
-            csv.writer(f).writerow([
-                round(iter_start - start_t, 2), 
-                round(throughput, 2), 
-                round(skew, 4), 
-                round(fairness, 4)
-            ])
-            
-        time.sleep(POLL_INTERVAL)
+        if time.time() - start_time >= MASTER_RUN_SECONDS:
+            info("*** Time limit reached\n")
+            STOP_FLAG.set()
+            break
 
-# ==============================================================================
-# MAIN RUNNER
-# ==============================================================================
-def run_experiment(net, seed=RANDOM_SEED):
-    os.system(f"rm -f {TRAFFIC_LOG_DIR}/*.json")
-    
-    # 1. Start Servers (Warmup to fix Connection Refused)
-    info("*** Starting iperf3 servers (5s warmup)...\n")
+        if len(hosts) < 2:
+            time.sleep(flow_interval_sec)
+            continue
+
+        src_host = random.choice(hosts)
+        dst = random.choice([h for h in hosts if h.IP() != src_host.IP()])
+        dst_ip = dst.IP()
+
+        ftype = choose_flow_type()
+        duration, bandwidth, pstreams = sample_flow_params(ftype)
+
+        remaining = MASTER_RUN_SECONDS - (time.time() - start_time)
+        duration = min(duration, remaining)
+
+        json_log = None
+        if ftype == 'elephant':
+            json_log = os.path.join(
+                TRAFFIC_LOG_DIR,
+                f"bg_elephant_{src_host.name}_to_{dst.name}_{int(time.time())}.json"
+            )
+
+        t = threading.Thread(
+            target=run_traffic_flow,
+            args=(src_host, dst_ip, duration, bandwidth, pstreams),
+            kwargs={'json_logfile': json_log},
+            daemon=True
+        )
+        t.start()
+        FLOW_THREADS.append(t)
+
+        time.sleep(flow_interval_sec)
+
+    for t in FLOW_THREADS:
+        try: t.join(timeout=1)
+        except: pass
+
+# -------------------- API --------------------
+
+def generate_traffic(net, flow_interval_sec=1.5, master_run_seconds=120):
+    global MASTER_RUN_SECONDS
+    MASTER_RUN_SECONDS = master_run_seconds
+
+    STOP_FLAG.clear()
+
+    stop_all_iperf_servers(net)
+
     for h in net.hosts:
-        h.cmd("iperf3 -s -p 5001 &")
-    time.sleep(5) # CRITICAL WAIT
-    
-    # 2. Start Primary
-    setup_rl_handshake(net)
-    
-    # 3. Start Monitor
-    monitor_t = threading.Thread(target=monitor_links, args=(net,))
-    monitor_t.daemon = True
-    monitor_t.start()
-    
-    # 4. Start Traffic
-    start_t = time.time()
-    gen_t = threading.Thread(target=traffic_generator_loop, args=(net, seed, start_t))
-    gen_t.daemon = True
-    gen_t.start()
-    
-    # 5. Run Loop
-    info(f"*** Running Experiment for {EXPERIMENT_DURATION}s...\n")
-    for i in range(EXPERIMENT_DURATION):
-        time.sleep(1)
-        if i % 10 == 0 and i > 0:
-            info(f"... {i}s\n")
-            
-    # 6. Cleanup
-    # Stop generating new flows
+        start_iperf_server(h)
+
+    start_h1_h4_parallel_flow(net)
+
+    gen_thread = threading.Thread(
+        target=traffic_generation_loop,
+        args=(net, flow_interval_sec),
+        daemon=True
+    )
+    gen_thread.start()
+
+    def watchdog():
+        time.sleep(MASTER_RUN_SECONDS)
+        STOP_FLAG.set()
+        info("*** Watchdog: stopping\n")
+
+    threading.Thread(target=watchdog, daemon=True).start()
+
+    info(f"*** Traffic generator running for {MASTER_RUN_SECONDS}s\n")
+    return gen_thread
+
+def stop_traffic(net):
+    info("*** Stopping traffic...\n")
     STOP_FLAG.set()
-    info("*** Traffic Generation Stopped. Waiting 10s for flows to finish...\n")
-    # Give ample time for current flows to write JSON before killing
-    time.sleep(10) 
-    
-    info("*** Killing processes...\n")
-    for h in net.hosts: h.cmd("killall -9 iperf3")
-        
-    compute_final_report()
+    for t in FLOW_THREADS:
+        try: t.join(timeout=1)
+        except: pass
+    stop_all_iperf_servers(net)
+    info("*** Stopped.\n")
 
-def compute_final_report():
-    info("\n*** Final Summary ***\n")
-    type_stats = {}
-    
-    completed_count = 0
-    for fid, d in FLOW_METRICS.items():
-        # Only count successfully completed flows
-        if d.get('status') == 'completed':
-            completed_count += 1
-            t = d['type']
-            if t not in type_stats: type_stats[t] = {'fct': [], 'thru': []}
-            
-            dur = d['end'] - d['start']
-            type_stats[t]['fct'].append(dur)
-            type_stats[t]['thru'].append(d['throughput'])
-            
-    info(f"Total Flows Launched: {len(FLOW_METRICS)}\n")
-    info(f"Total Flows Completed: {completed_count}\n")
-            
-    csv_file = "final_comparison_results.csv"
-    file_exists = os.path.isfile(csv_file)
-    algo = os.environ.get("ROUTING_ALGO", "Unknown")
-    
-    rows = []
-    for t, s in type_stats.items():
-        rows.append({
-            "Algorithm": algo,
-            "FlowType": t,
-            "Count": len(s['fct']),
-            "Avg_FCT": sum(s['fct'])/len(s['fct']),
-            "Avg_Throughput": sum(s['thru'])/len(s['thru'])
-        })
-        
-    print(json.dumps(rows, indent=2))
-    
-    with open(csv_file, 'a') as f:
-        headers = ["Algorithm", "FlowType", "Count", "Avg_FCT", "Avg_Throughput"]
-        writer = csv.DictWriter(f, fieldnames=headers)
-        if not file_exists: writer.writeheader()
-        for r in rows: writer.writerow(r)
-        
-    info(f"*** Saved to {csv_file} ***\n")
-
-def start_analysis(net):
-    run_experiment(net)
+if __name__ == "__main__":
+    info("This module is designed to be imported.\n")

@@ -1,19 +1,3 @@
-"""
-Final patched Ryu controller for the YAML leaf-spine topology.
-Features:
- - Network-wide ARP broadcast (sent via leaf uplinks -> spines -> target leaf)
- - SAME-LEAF fast path (direct host-to-host on leaf)
- - End-to-end flow install (ingress leaf -> chosen spine -> egress leaf -> host)
- - Reverse flows installed symmetrically
- - Elephant flows: SELECT group on ingress leaf + spine/egress flows
- - Uses OpenFlow port/flow stats for RL input
- - Idle timeouts for flows, group cleanup
- - Thread-safe (Lock) around shared state
-
-Elephant detection and promotion is performed from flow-stats polling:
- - when flow stats are received for a leaf, compute delta vs saved prev bytes
- - if delta >= ELEPHANT_BYTES (or absolute >= ELEPHANT_BYTES) promote on ingress leaf
-"""
 import time
 import numpy as np
 from collections import deque
@@ -30,7 +14,6 @@ from ryu.lib import hub
 from ryu.ofproto import ofproto_v1_3
 from ryu.lib.packet import packet, ethernet, ipv4, arp
 
-# RL model: keep unchanged (controller expects policy(state_np) -> (probs, action_idx))
 from src.rl.rl_model_x import ActorCritic
 
 # ---------------------------
@@ -491,7 +474,6 @@ class RLDCController(app_manager.RyuApp):
 
     # -------------------------
     # Packet-in
-    # (left mostly unchanged; uses _is_elephant only as a hint, promotion handled by polling)
     # -------------------------
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in(self, ev):
@@ -636,9 +618,6 @@ class RLDCController(app_manager.RyuApp):
                 state.append(loss)
             state_np = np.array(state, dtype=np.float32)
 
-        # elephant detection hint (legacy). Promotion is performed by polling.
-        # is_elephant = self._is_elephant(flow_key, ingress_leaf)
-
         # policy (keeps the RL model unchanged)
         probs, action_idx = self.model.policy(state_np)
         # self.logger.info("probs: %s",probs)
@@ -656,25 +635,10 @@ class RLDCController(app_manager.RyuApp):
         chosen_port = candidate_ports[chosen_idx]
 
         # install on ingress leaf
-        # if not is_elephant:
-            # mice: install direct flow to chosen uplink port
         self._install_simple_flow(dp_ing, src, dst, chosen_port, idle_timeout=FLOW_IDLE_TIMEOUT)
         flow_type = 'mice'
         self.logger.info("MICE %s->%s chosen port %s at leaf %s", src, dst, chosen_port, ingress_leaf)
         actions_out = [dp_ing.ofproto_parser.OFPActionOutput(chosen_port)]
-        # else:
-            # elephant path (packet_in-level fallback) - group install still allowed, but main promotion done by polling
-            # weights_np = (probs * GROUP_WEIGHT_SCALE).astype(int)
-            # weights = [max(1, int(w)) for w in weights_np]
-            # # weights = np.maximum(weights, 1)
-            # gid = self._group_id_from_flow(flow_key)
-            # self._install_select_group(dp_ing, gid, candidate_ports, weights)
-            # self._install_flow_to_group(dp_ing, src, dst, gid, idle_timeout=FLOW_IDLE_TIMEOUT)
-            # flow_type = 'elephant'
-            # self.logger.info("ELEPHANT (packet_in) %s->%s group %s ports %s weights %s at leaf %s", src, dst, gid, candidate_ports, weights.tolist(), ingress_leaf)
-            # actions_out = [dp_ing.ofproto_parser.OFPActionGroup(gid)]
-            # with self.lock:
-            #     self.groups_last_used[(ingress_leaf, gid)] = time.time()
 
         # ---------- INSTALL spine + egress leaf rules ----------
         spine_dpid = SPINES[chosen_idx] if chosen_idx < len(SPINES) else SPINES[0]
@@ -898,7 +862,7 @@ class RLDCController(app_manager.RyuApp):
                         dpid = meta['dpid']
                         candidate_ports = meta['candidate_ports']
                         with self.lock:
-                            next_state = []#[min(self.port_stats.get(dpid, {}).get(p, {}).get('util', 0.0) / CAPACITY_Mbps, 1.0) for p in candidate_ports]
+                            next_state = []
                             for p in candidate_ports:
                                 entry = self.port_stats.get(dpid, {}).get(p, {})
                                 util = entry.get('util', 0.0)
@@ -1025,7 +989,6 @@ class RLDCController(app_manager.RyuApp):
             src_dst = flow_id_key[0]
             src_ip, dst_ip = src_dst
             match = parser.OFPMatch(eth_type=0x0800, ipv4_src=src_ip, ipv4_dst=dst_ip)
-            # Use command DELETE to remove matching flows
             fm = parser.OFPFlowMod(datapath=dp,
                                 command=ofp.OFPFC_DELETE,
                                 out_port=ofp.OFPP_ANY,

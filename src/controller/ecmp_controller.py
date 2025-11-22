@@ -12,8 +12,8 @@ from ryu.lib.packet import packet, ethernet, ipv4, arp
 # Config
 # ---------------------------
 POLL_INTERVAL = 2.0                 # seconds between port/flow polls
-ELEPHANT_BYTES = 2 * 1024 * 1024    # 2 MB promotion threshold
-CAPACITY_Mbps = 1000.0              # normalize Mbps by this (1 Gbps)
+ELEPHANT_BYTES = 2 * 1024 * 1024    
+CAPACITY_Mbps = 1000.0              
 GROUP_WEIGHT_SCALE = 100           # scale prob -> bucket weight
 
 config_file = os.environ.get("NETWORK_CONFIG_FILE", "network_config3.yaml")

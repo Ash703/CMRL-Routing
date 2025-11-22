@@ -17,7 +17,7 @@ from ryu.lib.packet import packet, ethernet, ipv4, arp
 # Config
 # ---------------------------
 POLL_INTERVAL = 2.0                 # seconds between port/flow polls
-ELEPHANT_BYTES = 2 * 1024 * 1024    # 2 MB promotion threshold
+ELEPHANT_BYTES = 2 * 1024 * 1024    
 CAPACITY_Mbps = 1000.0              # normalize Mbps by this (1 Gbps)
 FLOW_IDLE_TIMEOUT = 30              # seconds idle timeout for per-flow rules
 
@@ -378,6 +378,7 @@ class RLDCController(app_manager.RyuApp):
             return
 
         # chosen uplink port on ingress leaf
+        # Greedy Selection of path
         chosen_idx = int(np.argmin(state))
         chosen_port = candidate_ports[chosen_idx]
 

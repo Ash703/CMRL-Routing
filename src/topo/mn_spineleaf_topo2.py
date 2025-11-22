@@ -9,6 +9,7 @@ from mininet.link import TCLink
 from mininet.log import setLogLevel
 from mininet.log import info
 from mininet.cli import CLI
+# from TrafficSimulator import generate_traffic
 
 # from traffic_gen2 import generate_traffic
 
@@ -43,7 +44,7 @@ def create_mininet_network(config_file, ctrl="127.0.0.1"):
             target_switch,
             port1=link_config["source_port"],
             port2=link_config["target_port"],
-             delay='1ms', loss=0.5
+             delay='0.01ms', loss=0.05, max_queue_size=1000
         )
 
     info("*** Adding hosts\n")
@@ -57,7 +58,7 @@ def create_mininet_network(config_file, ctrl="127.0.0.1"):
         hosts[host_config["name"]] = host
         switch = switches[host_config["connected_to"]]
         port = host_config["port"]
-        net.addLink(host, switch, port1=port, delay='2ms', loss=1)
+        net.addLink(host, switch, port1=port, delay='0.1ms', loss=0.1, max_queue_size=500)
 
     info("*** Starting network\n")
     net.build()
@@ -71,6 +72,7 @@ def create_mininet_network(config_file, ctrl="127.0.0.1"):
     # generate_traffic(net)   # run your custom traffic patterns
 
     # info("*** Dropping to CLI\n")
+    # generate_traffic(net)
 
     CLI(net)
 
